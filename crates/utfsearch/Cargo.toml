@@ -1,0 +1,23 @@
+[package]
+name = "utfsearch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI and MCP adapters for the UTFsearch catalog"
+
+[[bin]]
+name = "utfsearch"
+path = "src/main.rs"
+
+[dependencies]
+utfsearch-core = { path = "../utfsearch-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/utfsearch-core", "crates/utfsearch"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/utfsearch/utfsearch"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

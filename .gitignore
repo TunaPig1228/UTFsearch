@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.uts
+*.uts.tmp
+utfsearch.last
+.cargo/
+.DS_Store
+Thumbs.db
+.env
+*.exe
