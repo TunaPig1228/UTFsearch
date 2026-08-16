@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="430" viewBox="0 0 980 430" role="img" aria-label="Example search result">
+  <rect width="980" height="430" rx="16" fill="#0f172a"/>
+  <style>.ui { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</style>
+  <rect x="12" y="12" width="956" height="36" rx="8" fill="#020617"/>
+  <circle cx="34" cy="30" r="6" fill="#f87171"/>
+  <circle cx="54" cy="30" r="6" fill="#fbbf24"/>
+  <circle cx="74" cy="30" r="6" fill="#34d399"/>
+  <text x="100" y="35" class="ui" font-size="13" fill="#94a3b8">example</text>
+  <text x="28" y="78" class="ui" font-size="15" fill="#64748b">$</text>
+  <text x="48" y="78" class="ui" font-size="15" fill="#f8fafc">utfsearch search invoice --ext xlsx --limit 5</text>
+  <rect x="24" y="100" width="932" height="300" rx="10" fill="#020617"/>
+  <text x="44" y="136" class="ui" font-size="14" fill="#38bdf8">{</text>
+  <text x="64" y="164" class="ui" font-size="14" fill="#94a3b8">"hits": [{</text>
+  <text x="84" y="192" class="ui" font-size="14" fill="#e2e8f0">"rel":  "finance/2024/invoices/INV-1042.xlsx"</text>
+  <text x="84" y="220" class="ui" font-size="14" fill="#fbbf24">"root": "\\\\fileserver\\share"</text>
+  <text x="84" y="248" class="ui" font-size="14" fill="#86efac">"path": "\\\\fileserver\\share\\finance\\2024\\invoices\\INV-1042.xlsx"</text>
+  <text x="84" y="276" class="ui" font-size="14" fill="#cbd5e1">"kind": "file", "ext": "xlsx"</text>
+  <text x="64" y="308" class="ui" font-size="14" fill="#94a3b8">}]</text>
+  <text x="44" y="336" class="ui" font-size="14" fill="#38bdf8">}</text>
+  <text x="44" y="376" class="ui" font-size="13" fill="#64748b">root and path are absolute, so another system can open the file directly</text>
+</svg>

@@ -1,16 +1,12 @@
 <p align="center">
-  <img src="docs/brand/logo-mark.jpg" width="120" alt="UTFsearch mark"/>
-</p>
-
-<p align="center">
-  <img src="docs/brand/wordmark.jpg" width="420" alt="UTFsearch"/>
+  <img src="docs/brand/logo-mark.jpg" width="96" alt="UTFsearch"/>
 </p>
 
 <h1 align="center">UTFsearch</h1>
 
 <p align="center">
-  <strong>Local-first path catalog for humans and agents.</strong><br/>
-  Find a file among tens of millions of deep, mixed-script names — without walking the live NAS.
+  <strong>A local catalog for file names and paths.</strong><br/>
+  Index a folder once. Search it without walking the live tree.
 </p>
 
 <p align="center">
@@ -22,125 +18,77 @@
 
 ---
 
-中文使用者：這是給檔名／路徑用的本機搜尋引擎。第一次 `index --root`，之後 `search 發票`。結果裡的 `root` 與 `path` 都是絕對路徑，方便接 ERP、agent 或其他系統。
+本機檔名／路徑搜尋。第一次 `index --root`，之後 `search`。結果裡的 `root` 與 `path` 都是絕對路徑，方便接到其他系統。
 
-## Why it exists
+## What it is
 
-Shared drives and NAS trees are deep, multilingual, and too large to `dir /s` on every question. UTFsearch builds a compact catalog of **metadata only**, then answers from that catalog.
+UTFsearch is a **metadata catalog**, not a content search engine and not a SQL database.
 
-| You have | UTFsearch does |
+It walks operator-declared Roots, stores names, paths, sizes, times, and owners, then answers from a memory-mapped `catalog.uts`. Queries never re-list the live disk.
+
+| Need | Behavior |
 | --- | --- |
-| 30M files on an OS-mounted share | One local `catalog.uts`, mmap'd at query time |
-| CJK / accented / mixed names | Unicode-normalized filename index (NFC, Windows case-fold) |
-| An AI agent that must not wander | Jail: only operator Roots, no file-content read |
-| Another system that needs a real path | Each hit carries absolute `root` + `path` |
+| Mixed-script names | Unicode-normalized filename index |
+| Agent / script use | Same `Catalog::search` via CLI or MCP |
+| Hand a result to another system | Absolute `root` and `path` on every hit |
+| Keep scans cheap | Skip OS noise and package trees (`node_modules`, `.venv`, `build`, …) |
 
-It is **not** a content search engine and **not** a SQL warehouse. That is deliberate: a path catalog is a dictionary problem.
+## Example result
 
-## Real search output
+Illustrative hit shape (fictional share). `path` is what another program opens.
 
-These panels are drawn from a live run against [`docs/fixtures/sample-share`](docs/fixtures/sample-share) on this machine.
-
-**Filename search** (`utfsearch search 發票 --limit 5`) — hits the CJK name, not a live walk:
-
-![search 發票](docs/assets/search-name.svg)
-
-**Filter by extension** (`utfsearch search --ext xlsx --limit 5`) — same catalog, different Query:
-
-![search --ext xlsx](docs/assets/search-ext.svg)
-
-Every hit is ready to plug elsewhere:
+![example search](docs/assets/search-example.svg)
 
 ```json
 {
-  "rel": "docs/2024/發票/客戶A-發票-202403.xlsx",
-  "root": "C:\\Users\\chase\\Documents\\UTFsearch\\docs\\fixtures\\sample-share",
-  "path": "C:\\Users\\chase\\Documents\\UTFsearch\\docs\\fixtures\\sample-share\\docs\\2024\\發票\\客戶A-發票-202403.xlsx"
+  "rel": "finance/2024/invoices/INV-1042.xlsx",
+  "root": "\\\\fileserver\\share",
+  "path": "\\\\fileserver\\share\\finance\\2024\\invoices\\INV-1042.xlsx",
+  "kind": "file",
+  "ext": "xlsx"
 }
 ```
 
-`root` is the full Root directory. `path` is the full file path. Downstream tools do not need a second lookup.
-
-## 60-second start
+## Quick start
 
 ```text
 cargo build -p utfsearch --release
-utfsearch index --root D:\資料
-utfsearch search 發票
+utfsearch index --root D:\Share
+utfsearch search invoice
 utfsearch search --ext xlsx --after 2024-01-01 --limit 1000
 utfsearch refresh
 ```
 
-- `--root` is first-run only. Roots are stored in the catalog.
-- `--catalog` is optional. Default is `catalog.uts` next to the exe.
-- `--limit` is yours to set (default 200, hard max 5000).
-- Default `search <text>` matches **filename** only. Use `--path` for the relative path.
-
-## What it skips (so scans stay useful)
-
-By default it does not descend into noise:
-
-- OS: `$Recycle.Bin`, `System Volume Information`, `C:\Windows`, `Program Files`, SYSTEM-attribute files
-- Tooling: `node_modules`, `.venv` / `venv`, `__pycache__`, `build`, `dist`, `target`, `vendor`, `.git`
-
-Override with `--include-system` only if you truly need those trees.
+- `--root` only on the first index. Later commands reuse Roots stored in the catalog.
+- `--catalog` is optional (default: `catalog.uts` beside the exe).
+- `--limit` defaults to 200, maximum 5000.
+- Bare `search <text>` matches **filename** only. Use `--path` to search the relative path.
 
 ## Architecture
 
-<p align="center">
-  <img src="docs/assets/architecture.svg" width="820" alt="CLI and MCP share Catalog"/>
-</p>
+Index writes the catalog. Search only reads it.
 
-One deep module, two adapters:
+![architecture](docs/assets/architecture.svg)
 
-```text
-CLI  ──┐
-       ├──  Catalog::search(Query) → Page   ──  catalog.uts (mmap)
-MCP  ──┘
-```
-
-- **Interned path components** — 30M full strings are not stored as 30M strings
-- **Separate name and path trigram indexes** — filename search does not scan path postings
-- **Directory mtime prune** on `refresh` — unchanged trees are copied, not re-walked
-- **Atomic replace** — readers never see a half-written catalog
+CLI and MCP are adapters. They do not contain a second engine.
 
 ## Extensibility
 
-| Surface | Use it when |
+| Surface | Role |
 | --- | --- |
-| CLI | Operators, Task Scheduler, scripts |
-| `utfsearch mcp` | Cursor / Claude / other MCP hosts (stdio; HTTP needs a token) |
-| `utfsearch-core` crate | Embed `Catalog::search` in another Rust binary |
-| Hit.`path` | Hand the absolute path to ERP, a viewer, or a workflow |
+| CLI | Operators and scheduled refresh |
+| `utfsearch mcp` | MCP hosts over stdio |
+| `utfsearch-core` | Embed `Catalog::search` in another binary |
+| Hit.`path` | Pass a real filesystem path to ERP, a viewer, or a workflow |
 
-Adding a new protocol is another adapter. It should not grow a second engine.
+## Security
 
-```rust
-let page = catalog.search(Query { name: Some("發票".into()), limit: 200, ..Query::new() })?;
-for hit in page.hits {
-    // hit.path is the absolute location another system can open
-}
-```
+- Only declared Roots are visible
+- Every emitted path is jailed
+- No file-content read, no unbounded regex, no default network listener
 
-## Security posture
-
-- Deny-by-default Roots
-- Lexical jail on every emitted path
-- No `read_file`, no regex, no default network listener
-- Catalog file is metadata only (paths can still be sensitive)
-
-See [SECURITY.md](SECURITY.md).
-
-## Project map
-
-| | |
-| --- | --- |
-| Engine | `crates/utfsearch-core` |
-| CLI + MCP | `crates/utfsearch` |
-| Domain language | [`CONTEXT.md`](CONTEXT.md) |
-| Spec / plan | [`specs/001-utfsearch-catalog/`](specs/001-utfsearch-catalog/) |
-| Brand | [`docs/brand/`](docs/brand/) |
+[SECURITY.md](SECURITY.md)
 
 ## License
 
-[MIT](LICENSE) · Copyright 2026 TunaPig1228
+[MIT](LICENSE)

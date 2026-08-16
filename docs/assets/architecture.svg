@@ -1,27 +1,54 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="280" viewBox="0 0 980 280" role="img" aria-label="UTFsearch architecture">
-  <rect width="980" height="280" rx="16" fill="#f8fafc"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="420" viewBox="0 0 980 420" role="img" aria-label="UTFsearch index and search flows">
+  <rect width="980" height="420" rx="16" fill="#f8fafc"/>
   <style>
     .t { font-family: ui-sans-serif, system-ui, Segoe UI, sans-serif; }
     .m { font-family: ui-monospace, Consolas, monospace; }
   </style>
-  <rect x="24" y="36" width="200" height="88" rx="12" fill="#0f172a"/>
-  <text x="124" y="74" text-anchor="middle" class="t" font-size="15" fill="#f8fafc" font-weight="600">CLI</text>
-  <text x="124" y="98" text-anchor="middle" class="m" font-size="12" fill="#94a3b8">index · search</text>
-  <rect x="24" y="148" width="200" height="88" rx="12" fill="#0f172a"/>
-  <text x="124" y="186" text-anchor="middle" class="t" font-size="15" fill="#f8fafc" font-weight="600">MCP / library</text>
-  <text x="124" y="210" text-anchor="middle" class="m" font-size="12" fill="#94a3b8">agents · embed</text>
-  <path d="M224 80 H300" stroke="#f59e0b" stroke-width="3"/>
-  <path d="M224 192 H300" stroke="#f59e0b" stroke-width="3"/>
-  <rect x="300" y="56" width="280" height="168" rx="14" fill="#1e3a5f"/>
-  <text x="440" y="108" text-anchor="middle" class="t" font-size="18" fill="#fff" font-weight="700">Catalog</text>
-  <text x="440" y="136" text-anchor="middle" class="t" font-size="13" fill="#cbd5e1">search(Query) → Page</text>
-  <text x="440" y="164" text-anchor="middle" class="m" font-size="12" fill="#fbbf24">name index · path index</text>
-  <text x="440" y="186" text-anchor="middle" class="m" font-size="12" fill="#93c5fd">jail · 5000 cap</text>
-  <path d="M580 140 H656" stroke="#f59e0b" stroke-width="3"/>
-  <rect x="656" y="36" width="300" height="88" rx="12" fill="#fff" stroke="#cbd5e1"/>
-  <text x="806" y="74" text-anchor="middle" class="t" font-size="15" fill="#0f172a" font-weight="600">catalog.uts</text>
-  <text x="806" y="98" text-anchor="middle" class="m" font-size="12" fill="#64748b">mmap · interned paths</text>
-  <rect x="656" y="148" width="300" height="88" rx="12" fill="#fff" stroke="#cbd5e1"/>
-  <text x="806" y="186" text-anchor="middle" class="t" font-size="15" fill="#0f172a" font-weight="600">OS-mounted NAS</text>
-  <text x="806" y="210" text-anchor="middle" class="m" font-size="12" fill="#64748b">SMB / NFS via the OS</text>
+
+  <text x="32" y="36" class="t" font-size="13" font-weight="700" fill="#64748b" letter-spacing="1.5">INDEX / REFRESH — writes the catalog</text>
+
+  <rect x="32" y="52" width="170" height="72" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="117" y="82" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#0f172a">Mounted folder</text>
+  <text x="117" y="104" text-anchor="middle" class="m" font-size="11" fill="#64748b">OS disk / NAS</text>
+
+  <path d="M202 88 H232" stroke="#94a3b8" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="232" y="52" width="170" height="72" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="317" y="82" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#0f172a">Walker</text>
+  <text x="317" y="104" text-anchor="middle" class="m" font-size="11" fill="#64748b">skip · prune</text>
+
+  <path d="M402 88 H432" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="432" y="52" width="170" height="72" rx="10" fill="#0f172a"/>
+  <text x="517" y="82" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#f8fafc">Writer</text>
+  <text x="517" y="104" text-anchor="middle" class="m" font-size="11" fill="#fbbf24">atomic replace</text>
+
+  <path d="M602 88 H632" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="632" y="52" width="316" height="72" rx="10" fill="#1e3a5f"/>
+  <text x="790" y="82" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#f8fafc">catalog.uts</text>
+  <text x="790" y="104" text-anchor="middle" class="m" font-size="11" fill="#93c5fd">name index · path index · metadata</text>
+
+  <text x="32" y="196" class="t" font-size="13" font-weight="700" fill="#64748b" letter-spacing="1.5">SEARCH — does not walk the disk</text>
+
+  <rect x="32" y="216" width="170" height="72" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="117" y="246" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#0f172a">CLI</text>
+  <text x="117" y="268" text-anchor="middle" class="m" font-size="11" fill="#64748b">utfsearch search</text>
+
+  <rect x="32" y="304" width="170" height="72" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="117" y="334" text-anchor="middle" class="t" font-size="14" font-weight="600" fill="#0f172a">MCP / crate</text>
+  <text x="117" y="356" text-anchor="middle" class="m" font-size="11" fill="#64748b">agents · embed</text>
+
+  <path d="M202 252 H262" stroke="#f59e0b" stroke-width="2.5"/>
+  <path d="M202 340 H262" stroke="#f59e0b" stroke-width="2.5"/>
+  <path d="M262 252 V340" stroke="#f59e0b" stroke-width="2.5"/>
+  <path d="M262 296 H302" stroke="#f59e0b" stroke-width="2.5"/>
+
+  <rect x="302" y="248" width="260" height="96" rx="12" fill="#0f172a"/>
+  <text x="432" y="288" text-anchor="middle" class="t" font-size="16" font-weight="700" fill="#f8fafc">Catalog</text>
+  <text x="432" y="314" text-anchor="middle" class="m" font-size="12" fill="#fbbf24">search(Query) → Page</text>
+
+  <path d="M562 296 H632" stroke="#f59e0b" stroke-width="2.5"/>
+  <rect x="632" y="248" width="316" height="96" rx="12" fill="#1e3a5f"/>
+  <text x="790" y="288" text-anchor="middle" class="t" font-size="16" font-weight="700" fill="#f8fafc">catalog.uts</text>
+  <text x="790" y="314" text-anchor="middle" class="m" font-size="12" fill="#93c5fd">mmap read only</text>
+
+  <text x="32" y="404" class="t" font-size="12" fill="#94a3b8">Search never lists the live tree. Index and refresh are the only writers.</text>
 </svg>
