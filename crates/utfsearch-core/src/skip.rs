@@ -1,7 +1,7 @@
 use std::path::Path;
 
 /// Directory names skipped at any depth (case-insensitive).
-const ALWAYS: &[&str] = &[
+pub const ALWAYS: &[&str] = &[
     "$recycle.bin",
     "recycle.bin",
     "system volume information",
@@ -58,7 +58,7 @@ const ALWAYS: &[&str] = &[
 ];
 
 /// Only skipped when they sit directly on a drive root (`C:\Windows`).
-const VOLUME_CHILD: &[&str] = &[
+pub const VOLUME_CHILD: &[&str] = &[
     "windows",
     "program files",
     "program files (x86)",
@@ -70,7 +70,7 @@ const VOLUME_CHILD: &[&str] = &[
     "nvidia",
 ];
 
-const SKIP_FILES: &[&str] = &[
+pub const SKIP_FILES: &[&str] = &[
     "pagefile.sys",
     "hiberfil.sys",
     "swapfile.sys",

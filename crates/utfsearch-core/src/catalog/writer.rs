@@ -359,8 +359,28 @@ fn write_catalog(
     f.write_all(&path_tri_sec)?;
     f.sync_all()?;
     drop(f);
-    fs::rename(&tmp, path)?;
-    Ok(())
+    
+    // Retry rename operation with exponential backoff - file may still be locked
+    let mut retry_count = 0;
+    let max_retries = 10;
+    loop {
+        match fs::rename(&tmp, path) {
+            Ok(_) => {
+                eprintln!("Catalog written successfully to: {}", path.display());
+                return Ok(());
+            }
+            Err(e) if retry_count < max_retries => {
+                retry_count += 1;
+                let delay_ms = 100 * retry_count;
+                eprintln!("Failed to rename catalog (attempt {}): {}, retrying in {}ms...", retry_count, e, delay_ms);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+            }
+            Err(e) => {
+                eprintln!("Failed to rename catalog after {} attempts: {}", max_retries, e);
+                return Err(e.into());
+            }
+        }
+    }
 }
 
 fn rel_from_entries(entries: &[PackedEntry], intern: &Intern, mut id: u32, casefold: bool) -> String {

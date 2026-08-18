@@ -3,9 +3,13 @@ mod intern;
 mod trigram;
 pub mod writer;
 
+use std::collections::HashMap;
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
+use lru::LruCache;
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -23,6 +27,9 @@ use crate::walk::DirMtimes;
 
 pub use writer::{build, BuildStats};
 
+/// Query-result cache capacity (distinct queries kept warm).
+const SEARCH_CACHE_CAP: usize = 256;
+
 pub struct Catalog {
     _file: File,
     map: Mmap,
@@ -33,9 +40,20 @@ pub struct Catalog {
     ext_idx: Vec<(u16, RoaringBitmap)>,
     owner_idx: Vec<(u16, RoaringBitmap)>,
     mtime_ids: Vec<u32>,
+    /// Position of each entry id within `mtime_ids` (newest = 0). Built lazily:
+    /// only the small-candidate search path needs it, so pure large searches
+    /// never pay for it.
+    mtime_rank: OnceLock<Vec<u32>>,
     roots: Vec<StoredRoot>,
-    children: Vec<Vec<u32>>,
-    rel_index: std::collections::HashMap<(u16, String), u32>,
+    /// Parent -> children adjacency. Built lazily on first directory listing;
+    /// `search` never touches it.
+    children: OnceLock<Vec<Vec<u32>>>,
+    /// (root_id, relative-path) -> id. Built lazily on first `id_by_rel`; this
+    /// is the single most expensive structure to build (a parent-chain walk
+    /// per entry) and `search` never needs it.
+    rel_index: OnceLock<HashMap<(u16, String), u32>>,
+    /// Memoized query results. Immutable catalog, so entries never go stale.
+    search_cache: Mutex<LruCache<Query, Page>>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,10 +125,14 @@ impl Catalog {
         let roots = load_roots(slice(&map, hdr.roots_off, hdr.roots_len)?, &intern)?;
 
         let n = hdr.entry_count as usize;
-        let mut children = vec![Vec::new(); n];
-        let mut rel_index = std::collections::HashMap::new();
-        let cat_tmp_entries = n;
-        let mut c = Self {
+        let _ = n;
+        // `children`, `rel_index`, and `mtime_rank` are intentionally NOT built
+        // here. They are O(n) (and `rel_index` walks the parent chain for every
+        // entry) but are only needed by directory listing / refresh / the
+        // small-candidate search path. Building them lazily keeps `open()` — and
+        // therefore every one-shot `search` CLI invocation — fast on huge
+        // catalogs. This mirrors Tantivy's "tiny startup time" design goal.
+        let c = Self {
             _file: file,
             map,
             hdr,
@@ -120,25 +142,14 @@ impl Catalog {
             ext_idx,
             owner_idx,
             mtime_ids,
+            mtime_rank: OnceLock::new(),
             roots,
-            children: vec![Vec::new(); cat_tmp_entries],
-            rel_index: std::collections::HashMap::new(),
+            children: OnceLock::new(),
+            rel_index: OnceLock::new(),
+            search_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SEARCH_CACHE_CAP).expect("cache cap is nonzero"),
+            )),
         };
-        for id in 0..n as u32 {
-            let e = c.packed(id)?;
-            if e.parent != NONE {
-                if (e.parent as usize) < children.len() {
-                    children[e.parent as usize].push(id);
-                }
-            }
-        }
-        for id in 0..n as u32 {
-            let e = c.packed(id)?;
-            let rel = c.rel_path(id);
-            rel_index.insert((e.root_id as u16, rel), id);
-        }
-        c.children = children;
-        c.rel_index = rel_index;
         Ok(c)
     }
 
@@ -156,11 +167,49 @@ impl Catalog {
     }
 
     pub fn children(&self, id: u32) -> Vec<u32> {
-        self.children.get(id as usize).cloned().unwrap_or_default()
+        self.children_index()
+            .get(id as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn id_by_rel(&self, root_id: u16, rel: &str) -> Option<u32> {
-        self.rel_index.get(&(root_id, rel.to_string())).copied()
+        self.rel_index_map()
+            .get(&(root_id, rel.to_string()))
+            .copied()
+    }
+
+    /// Lazily build the parent -> children adjacency list. Only directory
+    /// listing and refresh need it; `search` never does.
+    fn children_index(&self) -> &Vec<Vec<u32>> {
+        self.children.get_or_init(|| {
+            let n = self.hdr.entry_count as usize;
+            let mut children = vec![Vec::new(); n];
+            for id in 0..n as u32 {
+                if let Ok(e) = self.packed(id) {
+                    if e.parent != NONE && (e.parent as usize) < n {
+                        children[e.parent as usize].push(id);
+                    }
+                }
+            }
+            children
+        })
+    }
+
+    /// Lazily build the (root_id, rel) -> id map. This is the single most
+    /// expensive structure (a parent-chain walk per entry) and is only needed
+    /// by directory listing / refresh — never by `search`.
+    fn rel_index_map(&self) -> &HashMap<(u16, String), u32> {
+        self.rel_index.get_or_init(|| {
+            let n = self.hdr.entry_count as usize;
+            let mut map = HashMap::with_capacity(n);
+            for id in 0..n as u32 {
+                if let Ok(e) = self.packed(id) {
+                    map.insert((e.root_id as u16, self.rel_path(id)), id);
+                }
+            }
+            map
+        })
     }
 
     pub fn rel_path(&self, mut id: u32) -> String {
@@ -240,8 +289,22 @@ impl Catalog {
 
     pub fn search(&self, q: Query) -> Result<Page> {
         let q = q.sanitize()?;
+        // Cache hit: identical query on an immutable catalog returns the same page.
+        if let Ok(mut cache) = self.search_cache.lock() {
+            if let Some(page) = cache.get(&q) {
+                return Ok(page.clone());
+            }
+        }
+        let page = self.search_uncached(&q)?;
+        if let Ok(mut cache) = self.search_cache.lock() {
+            cache.put(q, page.clone());
+        }
+        Ok(page)
+    }
+
+    fn search_uncached(&self, q: &Query) -> Result<Page> {
         let casefold = self.hdr.casefold();
-        let mut cand = self.seed_candidates(&q, casefold)?;
+        let mut cand = self.seed_candidates(q, casefold)?;
 
         if let Some(ext) = q.ext.as_deref() {
             if let Some(id) = self.intern.lookup(&ext_key(ext)) {
@@ -267,24 +330,84 @@ impl Catalog {
         }
 
         let limit = q.limit as usize;
+
+        // Fast path preserved from the original design: stream the pre-sorted
+        // mtime index (newest first) and stop as soon as `limit` hits are
+        // collected. This early termination is what keeps large-catalog
+        // searches fast, so it must remain the default.
+        //
+        // The only case where materializing the candidate set wins is when it
+        // is *small in absolute terms*: then sorting is negligible and we skip
+        // scanning millions of mtime entries whose ids are not candidates.
+        // Using an absolute (not ratio) threshold guarantees we never trade
+        // away early termination for a broad query.
+        const CANDIDATE_SCAN_MAX: usize = 8192;
+        if let Some(c) = cand.as_ref().map(|c| c.len() as usize) {
+            if c <= CANDIDATE_SCAN_MAX {
+                let bm = cand.as_ref().expect("cardinality implies Some");
+                let mut ids: Vec<u32> = bm.iter().collect();
+                ids.sort_unstable_by_key(|&id| self.mtime_rank(id));
+                return self.collect_hits(q, casefold, &ids, true, None, limit);
+            }
+        }
+        self.collect_hits(q, casefold, &self.mtime_ids, true, cand.as_ref(), limit)
+    }
+
+    #[inline]
+    fn mtime_rank(&self, id: u32) -> u32 {
+        self.mtime_rank_vec()
+            .get(id as usize)
+            .copied()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Lazily invert `mtime_ids` into id -> newest-first rank. Only the
+    /// small-candidate search path needs this.
+    fn mtime_rank_vec(&self) -> &Vec<u32> {
+        self.mtime_rank.get_or_init(|| {
+            let n = self.hdr.entry_count as usize;
+            let mut rank = vec![u32::MAX; n];
+            for (r, &id) in self.mtime_ids.iter().enumerate() {
+                if (id as usize) < n {
+                    rank[id as usize] = r as u32;
+                }
+            }
+            rank
+        })
+    }
+
+    /// Build a result page by streaming `ids` (already newest-first). When
+    /// `apply_filter` is true each id is tested against `cand` (contains) and
+    /// `passes()`; when false the ids are assumed already filtered.
+    fn collect_hits(
+        &self,
+        q: &Query,
+        casefold: bool,
+        ids: &[u32],
+        apply_filter: bool,
+        cand: Option<&RoaringBitmap>,
+        limit: usize,
+    ) -> Result<Page> {
         let mut hits = Vec::new();
         let mut dropped_unsafe = 0u32;
         let mut last: Option<Cursor> = None;
         let mut more = false;
 
-        for &id in &self.mtime_ids {
-            let e = self.packed(id)?;
-            if let Some(c) = &cand {
-                if !c.contains(id) {
-                    continue;
+        for &id in ids {
+            if apply_filter {
+                if let Some(c) = cand {
+                    if !c.contains(id) {
+                        continue;
+                    }
                 }
             }
+            let e = self.packed(id)?;
             if let Some(cur) = q.cursor {
                 if !after_cursor(e.mtime, id, cur) {
                     continue;
                 }
             }
-            if !self.passes(&q, id, &e, casefold) {
+            if apply_filter && !self.passes(q, id, &e, casefold) {
                 continue;
             }
             match self.to_hit(id, &e, q.view) {
@@ -452,13 +575,48 @@ impl Catalog {
                 return false;
             }
         }
-        let name = search_key(&self.intern.get_str(e.name_id), casefold);
-        let rel = search_key(&self.rel_path(id), casefold);
+
+        // Owner is a substring match on the interned owner string. Cheap and
+        // does not require the parent-chain walk.
+        if let Some(ow) = q.owner.as_deref() {
+            let have = search_key(&self.intern.get_str(e.owner_id as u32), true);
+            if !have.contains(&search_key(ow, true)) {
+                return false;
+            }
+        }
+
+        // Name / path substring checks. Compute the normalized name and the
+        // relative path lazily — the parent-chain walk in `rel_path` is the
+        // single most expensive per-entry operation, so it must only run when
+        // a path-oriented filter is actually present.
+        let needs_name = q.name.is_some() || !q.names.is_empty() || q.name_or_path.is_some();
+        let needs_rel = q.path.is_some() || q.name_or_path.is_some();
+
+        let name = if needs_name {
+            search_key(&self.intern.get_str(e.name_id), casefold)
+        } else {
+            String::new()
+        };
+        let rel = if needs_rel {
+            search_key(&self.rel_path(id), casefold)
+        } else {
+            String::new()
+        };
+
+        // Check single name filter (backward compatibility)
         if let Some(n) = q.name.as_deref() {
             if !name.contains(&search_key(n, casefold)) {
                 return false;
             }
         }
+
+        // Check multiple name filters - ALL must match (AND logic)
+        for n in &q.names {
+            if !name.contains(&search_key(n, casefold)) {
+                return false;
+            }
+        }
+
         if let Some(p) = q.path.as_deref() {
             if !rel.contains(&search_key(p, casefold)) {
                 return false;
@@ -467,12 +625,6 @@ impl Catalog {
         if let Some(nop) = q.name_or_path.as_deref() {
             let k = search_key(nop, casefold);
             if !name.contains(&k) && !rel.contains(&k) {
-                return false;
-            }
-        }
-        if let Some(ow) = q.owner.as_deref() {
-            let have = search_key(&self.intern.get_str(e.owner_id as u32), true);
-            if !have.contains(&search_key(ow, true)) {
                 return false;
             }
         }

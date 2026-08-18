@@ -4,13 +4,13 @@ pub mod catalog;
 pub mod error;
 pub mod jail;
 pub mod normalize;
-pub mod owner;
 pub mod paths;
 pub mod query;
 pub mod root;
 pub mod skip;
 pub mod walk;
 pub mod watch;
+pub mod wiztree;
 
 pub use catalog::{build, BuildStats, Catalog, Hit, Page, Status, StoredRoot};
 pub use error::{Error, Result};
