@@ -62,7 +62,7 @@ pub enum Cmd {
     Search {
         fragment: Option<String>,
         #[arg(long)]
-        name: Option<String>,
+        name: Vec<String>,
         #[arg(long)]
         path: Option<String>,
         #[arg(long)]
@@ -188,9 +188,19 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
         } => {
             let catalog = resolve_catalog(&cli)?;
             remember_catalog(&catalog);
+            let timing = std::env::var_os("UTFSEARCH_TIMING").is_some();
+            let t_open = std::time::Instant::now();
             let cat = Catalog::open(&catalog)?;
+            if timing {
+                eprintln!("[timing] open: {:?}", t_open.elapsed());
+            }
             let mut q = Query::new();
-            q.name = name.or(fragment);
+            // Use fragment as fallback if no --name args provided
+            if name.is_empty() {
+                q.name = fragment;
+            } else {
+                q.names = name;
+            }
             q.name_or_path = None;
             q.path = path;
             q.ext = ext;
@@ -206,7 +216,16 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
                 .map(utfsearch_core::Cursor::decode)
                 .transpose()?;
             q.view = if full { View::Full } else { View::Compact };
-            emit(&cli, &cat.search(q)?)
+            let t_search = std::time::Instant::now();
+            let page = cat.search(q)?;
+            if timing {
+                eprintln!(
+                    "[timing] search: {:?} ({} hits)",
+                    t_search.elapsed(),
+                    page.hits.len()
+                );
+            }
+            emit(&cli, &page)
         }
         Cmd::Tree { path, root, full } => {
             let cat = Catalog::open(&resolve_catalog(&cli)?)?;

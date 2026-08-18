@@ -32,22 +32,30 @@ pub fn intersect_postings(
     if grams.is_empty() {
         return None;
     }
-    let mut acc: Option<RoaringBitmap> = None;
+    // Resolve every gram to its posting list. A missing gram means no entry can
+    // contain the substring, so the result is empty.
+    let mut posts: Vec<&RoaringBitmap> = Vec::with_capacity(grams.len());
     for g in grams {
-        let found = index
+        match index
             .binary_search_by_key(g, |(k, _)| *k)
             .ok()
-            .map(|i| &index[i].1);
-        match (acc, found) {
-            (None, Some(bm)) => acc = Some(bm.clone()),
-            (Some(a), Some(bm)) => acc = Some(a & bm),
-            (_, None) => return Some(RoaringBitmap::new()),
-        }
-        if acc.as_ref().is_some_and(|a| a.is_empty()) {
-            return acc;
+            .map(|i| &index[i].1)
+        {
+            Some(bm) => posts.push(bm),
+            None => return Some(RoaringBitmap::new()),
         }
     }
-    acc
+    // Selectivity ordering: intersect smallest posting lists first so the
+    // running accumulator stays as small as possible, minimizing work.
+    posts.sort_unstable_by_key(|bm| bm.len());
+    let mut acc = posts[0].clone();
+    for bm in &posts[1..] {
+        if acc.is_empty() {
+            break;
+        }
+        acc &= *bm;
+    }
+    Some(acc)
 }
 
 #[cfg(test)]

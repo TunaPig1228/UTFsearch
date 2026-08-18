@@ -7,7 +7,7 @@ pub const MAX_LIMIT: u16 = 5000;
 pub const MAX_FILTER_CHARS: usize = 256;
 pub const PAGE_BUDGET: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum View {
     #[default]
@@ -15,9 +15,12 @@ pub enum View {
     Full,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Query {
+    /// Single name filter (for backward compatibility)
     pub name: Option<String>,
+    /// Multiple name filters - all must match (AND logic)
+    pub names: Vec<String>,
     pub path: Option<String>,
     /// Convenience: matches filename **or** relative path.
     pub name_or_path: Option<String>,
@@ -33,7 +36,7 @@ pub struct Query {
     pub view: View,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cursor {
     pub last_mtime: i64,
     pub last_id: u32,
@@ -85,6 +88,23 @@ impl Query {
             *ext = crate::normalize::ext_key(ext);
         }
         Ok(self)
+    }
+
+    /// True when the query has a predicate that requires per-entry scanning
+    /// (i.e. work beyond the pre-built trigram/ext/owner indexes). Used to
+    /// decide whether parallel filtering is worthwhile. `ext` is excluded
+    /// because it is fully covered by the extension index.
+    pub fn has_scan_predicate(&self) -> bool {
+        self.name.is_some()
+            || !self.names.is_empty()
+            || self.path.is_some()
+            || self.name_or_path.is_some()
+            || self.owner.is_some()
+            || self.root.is_some()
+            || self.mtime_min.is_some()
+            || self.mtime_max.is_some()
+            || self.size_min.is_some()
+            || self.size_max.is_some()
     }
 }
 
