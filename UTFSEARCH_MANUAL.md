@@ -73,6 +73,9 @@ utfsearch [全局選項] <命令> [命令選項]
 | 混合文字名稱 | 支持繁簡中文、日文、emoji 等 |
 | AI/自動化 | JSON 輸出，絕對路徑，適合集成 |
 | 網絡共享 | 跳過系統目錄，減少掃描時間 |
+| **已知資料夾位置** | **⚡ 用相對路徑前綴縮小範圍：數十倍加速** |
+
+> 💡 **核心加速技巧**：知道檔案在哪個資料夾？用 `--path` 給出從根開始的相對目錄路徑（如 `finance/2024`），程式會直接鎖定該子樹掃描，即使檔名條件不精確也能快速找到結果。
 
 ---
 
@@ -1172,6 +1175,10 @@ utfsearch search invoice
 :: 搜索（複雜）
 utfsearch --format json search --name invoice --ext xlsx --after 2024-01-01 --limit 100
 
+:: ⚡ 搜索（路徑前綴加速 — 推薦！）
+utfsearch search invoice --path finance/2024
+utfsearch search --name invoice --path finance/2024/invoices --ext xlsx
+
 :: 查看狀態
 utfsearch status
 
@@ -1182,6 +1189,12 @@ utfsearch tree finance/2024
 ### 一行命令模板
 
 ```batch
+:: ⚡ 加速查詢：用 --path 縮小相對路徑範圍（最有效的優化）
+utfsearch --format json --quiet search --name %NAME% --path %DIR% --ext %EXT% --limit %LIMIT%
+
+:: 範例
+utfsearch --format json --quiet search --name invoice --path finance/2024 --ext xlsx --limit 100
+
 :: AI 查詢
 utfsearch --format json --quiet search --path %PATH% --ext %EXT% --min-size %SIZE% --limit %LIMIT%
 
@@ -1191,8 +1204,8 @@ utfsearch --format json --quiet search --limit 100 --cursor %CURSOR%
 :: 時間範圍
 utfsearch search --after %DATE1% --before %DATE2% --limit 500
 
-:: 複合過濾
-utfsearch search --name %NAME% --ext %EXT% --owner %USER% --min-size %SIZE%
+:: 複合過濾（依選擇性排序）
+utfsearch search --path %DIR% --name %NAME% --ext %EXT% --owner %USER% --after %DATE%
 ```
 
 ### 環境變數
