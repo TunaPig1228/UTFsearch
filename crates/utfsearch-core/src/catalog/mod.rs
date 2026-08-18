@@ -52,10 +52,6 @@ pub struct Catalog {
     /// Parent -> children adjacency. Built lazily on first directory listing;
     /// `search` never touches it.
     children: OnceLock<Vec<Vec<u32>>>,
-    /// (root_id, normalized-relative-dir) -> id, for directories only. Built
-    /// lazily from the compact dirstat section (not a full parent-chain walk),
-    /// so resolving a path prefix to a subtree is cheap.
-    dir_index: OnceLock<HashMap<(u8, String), u32>>,
     /// (root_id, relative-path) -> id. Built lazily on first `id_by_rel`; this
     /// is the single most expensive structure to build (a parent-chain walk
     /// per entry) and `search` never needs it.
@@ -159,7 +155,6 @@ impl Catalog {
             mtime_rank: OnceLock::new(),
             roots,
             children: OnceLock::new(),
-            dir_index: OnceLock::new(),
             rel_index: OnceLock::new(),
             search_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(SEARCH_CACHE_CAP).expect("cache cap is nonzero"),
@@ -211,38 +206,6 @@ impl Catalog {
         })
     }
 
-    /// Lazily build a directory-only `(root_id, normalized-rel) -> id` map from
-    /// the compact dirstat section. Far cheaper than `rel_index_map` (dirs only,
-    /// no per-entry parent walk) and enough to resolve a path prefix to its
-    /// subtree.
-    fn dir_index(&self) -> &HashMap<(u8, String), u32> {
-        self.dir_index.get_or_init(|| {
-            let casefold = self.hdr.casefold();
-            let mut map = HashMap::new();
-            let Ok(sec) = slice(&self.map, self.hdr.dirstat_off, self.hdr.dirstat_len) else {
-                return map;
-            };
-            let mut off = 0usize;
-            let Ok(n) = read_u32(sec, &mut off) else {
-                return map;
-            };
-            for _ in 0..n {
-                let Ok(rel_id) = read_u32(sec, &mut off) else { break };
-                if off + 8 > sec.len() {
-                    break;
-                }
-                off += 8; // skip mtime_fine
-                let Ok(eid) = read_u32(sec, &mut off) else { break };
-                let rel = self.intern.get_str(rel_id);
-                let key = search_key(&rel, casefold);
-                if let Ok(e) = self.packed(eid) {
-                    map.insert((e.root_id, key), eid);
-                }
-            }
-            map
-        })
-    }
-
     /// Resolve a relative-path *prefix* (from a root) to the contiguous id
     /// window `[dir_id, subtree_end)` of that directory's subtree. Returns
     /// `None` for legacy catalogs without subtree data, or when the prefix does
@@ -258,29 +221,82 @@ impl Catalog {
             return None;
         }
         let rel = path.replace('\\', "/");
-        let rel = rel.trim_matches('/');
-        if rel.is_empty() {
+        // Split into path components; every non-empty segment must match a
+        // directory as we descend the DFS tree.
+        let comps: Vec<String> = rel
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| search_key(s, casefold))
+            .collect();
+        if comps.is_empty() {
             return None;
         }
-        let key = search_key(rel, casefold);
-        let idx = self.dir_index();
-        let end_of = |id: u32| -> Option<(u32, u32)> {
-            self.subtree_end.get(id as usize).map(|&end| (id, end))
+        let root_id: Option<u8> = match root_hint {
+            Some(rn) => Some(
+                self.roots
+                    .iter()
+                    .find(|r| r.name == rn || r.id.to_string() == rn)?
+                    .id as u8,
+            ),
+            None => None,
         };
-        if let Some(rn) = root_hint {
-            let rid = self
-                .roots
-                .iter()
-                .find(|r| r.name == rn || r.id.to_string() == rn)?
-                .id as u8;
-            return idx.get(&(rid, key)).copied().and_then(end_of);
-        }
-        for r in &self.roots {
-            if let Some(&id) = idx.get(&(r.id as u8, key.clone())) {
-                return end_of(id);
+
+        // Cheap component walk over the DFS pre-order layout (nested-set /
+        // interval labeling): a directory's subtree is the contiguous window
+        // `[id, subtree_end[id])`, its direct children start at `id + 1`, and
+        // each child's next sibling is at `subtree_end[child]`. So we only ever
+        // touch the entries that lie on the queried path — never an O(dirs)
+        // scan and never a per-process HashMap build. This is what keeps a
+        // narrowed `--path` in the microsecond range even on huge catalogs.
+        let end_of = |id: u32| self.subtree_end.get(id as usize).copied();
+        let name_key = |id: u32| -> Option<String> {
+            let e = self.packed(id).ok()?;
+            Some(search_key(&self.intern.get_str(e.name_id), casefold))
+        };
+
+        // Level 0: top-level entries (parent == NONE). They are laid out at
+        // 0, subtree_end[0], subtree_end[...], so we hop sibling-to-sibling.
+        let total = self.hdr.entry_count as u32;
+        let mut window: Option<(u32, u32)> = None;
+        let mut id = 0u32;
+        while id < total {
+            let end = end_of(id).unwrap_or(id + 1);
+            if let Ok(e) = self.packed(id) {
+                if e.parent == NONE
+                    && e.is_dir()
+                    && root_id.map_or(true, |rid| e.root_id == rid)
+                    && name_key(id).as_deref() == Some(comps[0].as_str())
+                {
+                    window = Some((id, end));
+                    break;
+                }
             }
+            id = end.max(id + 1);
         }
-        None
+        let (mut start, mut end) = window?;
+
+        // Descend the remaining components through direct children only.
+        for key in &comps[1..] {
+            let mut child = start + 1;
+            let mut next: Option<(u32, u32)> = None;
+            while child < end {
+                let cend = end_of(child).unwrap_or(child + 1);
+                if let Ok(e) = self.packed(child) {
+                    if e.parent == start
+                        && e.is_dir()
+                        && name_key(child).as_deref() == Some(key.as_str())
+                    {
+                        next = Some((child, cend));
+                        break;
+                    }
+                }
+                child = cend.max(child + 1);
+            }
+            let (s, en) = next?;
+            start = s;
+            end = en;
+        }
+        Some((start, end))
     }
 
     /// Lazily build the (root_id, rel) -> id map. This is the single most
