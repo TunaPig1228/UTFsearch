@@ -506,13 +506,29 @@ utfsearch search --ext iso --min-size 1GB
 
 ### 路徑匹配
 
-- **相對路徑**: 相對於根目錄
-- **片段搜索**: 搜索路徑中的任何部分
+`--path` 有兩種模式，程式會自動判斷：
+
+1. **目錄前綴（快速路徑，推薦）**：當 `--path` 的值正好是某個「從根目錄開始的相對目錄路徑」時，程式會直接鎖定該目錄的**子樹範圍**，只掃描該資料夾底下的項目。這是縮小範圍時效率大幅提升的關鍵。
+
+2. **片段回退（substring）**：當 `--path` 的值不是一個實際的目錄前綴（例如只給一個片段名稱）時，退回為對相對路徑做子字串比對。
 
 ```batch
-utfsearch search --path "finance/2024"    # 匹配包含該路徑的任何文件
-utfsearch search --path "reports"         # 匹配 reports 目錄下的所有文件
+# ✅ 目錄前綴（快速）：finance/2024 是真實目錄，直接鎖定子樹
+utfsearch search invoice --path finance/2024
+
+# ✅ 更深的前綴，範圍更小、更快
+utfsearch search invoice --path finance/2024/invoices
+
+# 片段回退：invoices 不是從根開始的完整路徑 → 子字串比對
+utfsearch search invoice --path invoices
 ```
+
+**重點**：
+- 路徑一律**相對於索引的根目錄**（不要包含根目錄名稱本身）。
+- 支援 `/` 或 `\`，前後多餘的斜線會自動忽略（`finance\2024\` = `finance/2024`）。
+- 縮小相對路徑範圍時，即使檔名條件不夠精確，也能大幅加速——因為程式只掃描該子樹，而不是整個目錄。
+
+> ℹ️ 此快速路徑需要 catalog 為 v3 格式。舊的 v2 catalog 仍可讀取，但會退回子字串比對；重新執行一次 `utfsearch index`（或 `refresh`）即可升級並啟用。
 
 ---
 
@@ -897,20 +913,22 @@ utfsearch index --root "D:\Share\Projects" --root "D:\Share\Data"
 :: ❌ 慢：掃描所有 100M 文件
 utfsearch search "2024" --limit 1000
 
-:: ✅ 快：先過濾到 1K 候選，再搜索
+:: ✅ 快：用「目錄前綴」把範圍鎖到子樹，再搜索
 utfsearch search "2024" --path "finance/2024" --ext xlsx --limit 1000
 ```
 
 #### 使用選擇性過濾
 
-按這個順序應用過濾器（最快的優先）：
+- **最有效的優化是 `--path` 目錄前綴**：只要給出從根目錄開始的相對目錄路徑，程式會直接把搜尋限制在該子樹的連續範圍內，掃描量從「整個目錄」降到「單一資料夾」，通常帶來數十倍的加速（且不需要精確的檔名）。
 
-1. `--ext` (通常最選擇性)
-2. `--path` (路徑過濾)
+其餘過濾器建議依選擇性由高到低組合：
+
+1. `--path <目錄前綴>` (最有效：鎖定子樹範圍)
+2. `--ext` (副檔名索引，通常很選擇性)
 3. `--owner` (所有者過濾)
 4. `--after/--before` (時間過濾)
 5. `--min-size/--max-size` (大小過濾)
-6. `--name` (名稱過濾，最後)
+6. `--name` (名稱片段)
 
 ### 3. Catalog 檔案
 

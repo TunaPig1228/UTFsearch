@@ -40,6 +40,10 @@ pub struct Catalog {
     ext_idx: Vec<(u16, RoaringBitmap)>,
     owner_idx: Vec<(u16, RoaringBitmap)>,
     mtime_ids: Vec<u32>,
+    /// One past the last id in each entry's subtree (DFS pre-order layout,
+    /// v3+). Empty for legacy v2 catalogs, which disables the prefix fast
+    /// path and falls back to substring path matching.
+    subtree_end: Vec<u32>,
     /// Position of each entry id within `mtime_ids` (newest = 0). Built lazily:
     /// only the small-candidate search path needs it, so pure large searches
     /// never pay for it.
@@ -48,6 +52,10 @@ pub struct Catalog {
     /// Parent -> children adjacency. Built lazily on first directory listing;
     /// `search` never touches it.
     children: OnceLock<Vec<Vec<u32>>>,
+    /// (root_id, normalized-relative-dir) -> id, for directories only. Built
+    /// lazily from the compact dirstat section (not a full parent-chain walk),
+    /// so resolving a path prefix to a subtree is cheap.
+    dir_index: OnceLock<HashMap<(u8, String), u32>>,
     /// (root_id, relative-path) -> id. Built lazily on first `id_by_rel`; this
     /// is the single most expensive structure to build (a parent-chain walk
     /// per entry) and `search` never needs it.
@@ -122,6 +130,11 @@ impl Catalog {
         let ext_idx = load_u16_bitmaps(slice(&map, hdr.ext_off, hdr.ext_len)?)?;
         let owner_idx = load_u16_bitmaps(slice(&map, hdr.owner_off, hdr.owner_len)?)?;
         let mtime_ids = load_u32_list(slice(&map, hdr.mtime_off, hdr.mtime_len)?)?;
+        let subtree_end = if hdr.subtree_len > 0 {
+            load_u32_list(slice(&map, hdr.subtree_off, hdr.subtree_len)?)?
+        } else {
+            Vec::new()
+        };
         let roots = load_roots(slice(&map, hdr.roots_off, hdr.roots_len)?, &intern)?;
 
         let n = hdr.entry_count as usize;
@@ -142,9 +155,11 @@ impl Catalog {
             ext_idx,
             owner_idx,
             mtime_ids,
+            subtree_end,
             mtime_rank: OnceLock::new(),
             roots,
             children: OnceLock::new(),
+            dir_index: OnceLock::new(),
             rel_index: OnceLock::new(),
             search_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(SEARCH_CACHE_CAP).expect("cache cap is nonzero"),
@@ -194,6 +209,78 @@ impl Catalog {
             }
             children
         })
+    }
+
+    /// Lazily build a directory-only `(root_id, normalized-rel) -> id` map from
+    /// the compact dirstat section. Far cheaper than `rel_index_map` (dirs only,
+    /// no per-entry parent walk) and enough to resolve a path prefix to its
+    /// subtree.
+    fn dir_index(&self) -> &HashMap<(u8, String), u32> {
+        self.dir_index.get_or_init(|| {
+            let casefold = self.hdr.casefold();
+            let mut map = HashMap::new();
+            let Ok(sec) = slice(&self.map, self.hdr.dirstat_off, self.hdr.dirstat_len) else {
+                return map;
+            };
+            let mut off = 0usize;
+            let Ok(n) = read_u32(sec, &mut off) else {
+                return map;
+            };
+            for _ in 0..n {
+                let Ok(rel_id) = read_u32(sec, &mut off) else { break };
+                if off + 8 > sec.len() {
+                    break;
+                }
+                off += 8; // skip mtime_fine
+                let Ok(eid) = read_u32(sec, &mut off) else { break };
+                let rel = self.intern.get_str(rel_id);
+                let key = search_key(&rel, casefold);
+                if let Ok(e) = self.packed(eid) {
+                    map.insert((e.root_id, key), eid);
+                }
+            }
+            map
+        })
+    }
+
+    /// Resolve a relative-path *prefix* (from a root) to the contiguous id
+    /// window `[dir_id, subtree_end)` of that directory's subtree. Returns
+    /// `None` for legacy catalogs without subtree data, or when the prefix does
+    /// not name an actual directory (e.g. a bare fragment), so callers can fall
+    /// back to substring matching.
+    fn resolve_prefix_dir(
+        &self,
+        path: &str,
+        root_hint: Option<&str>,
+        casefold: bool,
+    ) -> Option<(u32, u32)> {
+        if self.subtree_end.is_empty() {
+            return None;
+        }
+        let rel = path.replace('\\', "/");
+        let rel = rel.trim_matches('/');
+        if rel.is_empty() {
+            return None;
+        }
+        let key = search_key(rel, casefold);
+        let idx = self.dir_index();
+        let end_of = |id: u32| -> Option<(u32, u32)> {
+            self.subtree_end.get(id as usize).map(|&end| (id, end))
+        };
+        if let Some(rn) = root_hint {
+            let rid = self
+                .roots
+                .iter()
+                .find(|r| r.name == rn || r.id.to_string() == rn)?
+                .id as u8;
+            return idx.get(&(rid, key)).copied().and_then(end_of);
+        }
+        for r in &self.roots {
+            if let Some(&id) = idx.get(&(r.id as u8, key.clone())) {
+                return end_of(id);
+            }
+        }
+        None
     }
 
     /// Lazily build the (root_id, rel) -> id map. This is the single most
@@ -304,6 +391,29 @@ impl Catalog {
 
     fn search_uncached(&self, q: &Query) -> Result<Page> {
         let casefold = self.hdr.casefold();
+
+        // Directory-prefix fast path: when `--path` names an actual directory
+        // (a relative path from a root), collapse it to that directory's
+        // contiguous subtree id window instead of a substring scan. This is the
+        // single biggest win for "I know roughly which folder" queries.
+        let prefix_range = q
+            .path
+            .as_deref()
+            .and_then(|p| self.resolve_prefix_dir(p, q.root.as_deref(), casefold));
+
+        // When the prefix resolved exactly, drop the substring path filter so
+        // `passes()` never pays for the parent-chain `rel_path` walk; the id
+        // window already encodes the constraint precisely.
+        let effective;
+        let q: &Query = if prefix_range.is_some() {
+            let mut e = q.clone();
+            e.path = None;
+            effective = e;
+            &effective
+        } else {
+            q
+        };
+
         let mut cand = self.seed_candidates(q, casefold)?;
 
         if let Some(ext) = q.ext.as_deref() {
@@ -342,15 +452,71 @@ impl Catalog {
         // Using an absolute (not ratio) threshold guarantees we never trade
         // away early termination for a broad query.
         const CANDIDATE_SCAN_MAX: usize = 8192;
-        if let Some(c) = cand.as_ref().map(|c| c.len() as usize) {
-            if c <= CANDIDATE_SCAN_MAX {
-                let bm = cand.as_ref().expect("cardinality implies Some");
+        // A resolved directory prefix yields a contiguous id window. Iterating
+        // that window and sorting by entry mtime is cheap for anything up to a
+        // large folder, and — crucially — it is what makes "I narrowed the
+        // relative path" queries fast even without a selective name filter.
+        const SUBTREE_MATERIALIZE_MAX: usize = 1 << 18; // 262_144
+
+        // Choose an id source for the small-candidate fast path.
+        let small_ids: Option<Vec<u32>> = if let Some((d, e)) = prefix_range {
+            let window = e.saturating_sub(d) as usize;
+            if window <= SUBTREE_MATERIALIZE_MAX {
+                // Iterate the subtree window directly (the narrowed folder),
+                // keeping only ids that also satisfy the name/ext/owner
+                // candidate. Sorting on real mtime avoids building the O(n)
+                // mtime-rank vector for what is usually a small folder.
+                let mut ids: Vec<u32> = (d..e)
+                    .filter(|&id| cand.as_ref().map_or(true, |b| b.contains(id)))
+                    .collect();
+                self.sort_newest_first(&mut ids);
+                Some(ids)
+            } else if let Some(bm) = cand.as_ref() {
+                if (bm.len() as usize) <= CANDIDATE_SCAN_MAX {
+                    let mut ids: Vec<u32> =
+                        bm.iter().filter(|&id| in_range(id, prefix_range)).collect();
+                    self.sort_newest_first(&mut ids);
+                    Some(ids)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if let Some(bm) = cand.as_ref() {
+            if (bm.len() as usize) <= CANDIDATE_SCAN_MAX {
                 let mut ids: Vec<u32> = bm.iter().collect();
                 ids.sort_unstable_by_key(|&id| self.mtime_rank(id));
-                return self.collect_hits(q, casefold, &ids, true, None, limit);
+                Some(ids)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        if let Some(ids) = small_ids {
+            return self.collect_hits(q, casefold, &ids, true, None, prefix_range, limit);
         }
-        self.collect_hits(q, casefold, &self.mtime_ids, true, cand.as_ref(), limit)
+        self.collect_hits(
+            q,
+            casefold,
+            &self.mtime_ids,
+            true,
+            cand.as_ref(),
+            prefix_range,
+            limit,
+        )
+    }
+
+    /// Sort ids newest-first (mtime descending, id ascending on ties) by reading
+    /// each entry's mtime directly. Used by the subtree fast path so a narrowed
+    /// folder never has to build the catalog-wide mtime-rank vector.
+    fn sort_newest_first(&self, ids: &mut [u32]) {
+        ids.sort_unstable_by(|&a, &b| {
+            let ma = self.packed(a).map(|e| e.mtime).unwrap_or(i64::MIN);
+            let mb = self.packed(b).map(|e| e.mtime).unwrap_or(i64::MIN);
+            mb.cmp(&ma).then(a.cmp(&b))
+        });
     }
 
     #[inline]
@@ -378,7 +544,8 @@ impl Catalog {
 
     /// Build a result page by streaming `ids` (already newest-first). When
     /// `apply_filter` is true each id is tested against `cand` (contains) and
-    /// `passes()`; when false the ids are assumed already filtered.
+    /// `passes()`; when false the ids are assumed already filtered. `range`, if
+    /// present, restricts hits to the `[start, end)` subtree id window.
     fn collect_hits(
         &self,
         q: &Query,
@@ -386,6 +553,7 @@ impl Catalog {
         ids: &[u32],
         apply_filter: bool,
         cand: Option<&RoaringBitmap>,
+        range: Option<(u32, u32)>,
         limit: usize,
     ) -> Result<Page> {
         let mut hits = Vec::new();
@@ -394,6 +562,9 @@ impl Catalog {
         let mut more = false;
 
         for &id in ids {
+            if !in_range(id, range) {
+                continue;
+            }
             if apply_filter {
                 if let Some(c) = cand {
                     if !c.contains(id) {
@@ -657,6 +828,16 @@ impl Catalog {
 
 fn after_cursor(mtime: i64, id: u32, cur: Cursor) -> bool {
     mtime < cur.last_mtime || (mtime == cur.last_mtime && id > cur.last_id)
+}
+
+/// Whether `id` falls in the optional `[start, end)` subtree window. `None`
+/// means unrestricted.
+#[inline]
+fn in_range(id: u32, range: Option<(u32, u32)>) -> bool {
+    match range {
+        Some((start, end)) => id >= start && id < end,
+        None => true,
+    }
 }
 
 fn budget_full(hits: &[Hit]) -> bool {

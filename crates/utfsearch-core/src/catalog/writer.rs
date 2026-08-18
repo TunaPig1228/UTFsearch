@@ -73,13 +73,91 @@ pub fn build(catalog_path: &Path, roots: &RootSet, old: Option<&Catalog>) -> Res
         }
     }
 
-    write_catalog(catalog_path, roots, casefold, intern, entries, dir_stats)?;
+    // Reorder entries into DFS pre-order so every directory's subtree occupies
+    // a contiguous id range. This is what lets a relative-path prefix collapse
+    // to an O(1) `[start, end)` scan window instead of a substring walk over
+    // the whole catalog.
+    let entry_count = rel_of.len() as u64;
+    let (entries, dir_stats, subtree_end) = reorder_dfs(entries, dir_stats);
+
+    write_catalog(catalog_path, roots, casefold, intern, entries, dir_stats, subtree_end)?;
     Ok(BuildStats {
-        entries: rel_of.len() as u64,
+        entries: entry_count,
         pruned_dirs: pruned_total,
         visited_dirs,
         catalog: catalog_path.display().to_string(),
     })
+}
+
+/// Re-number entries in DFS pre-order and compute, for each new id, one past
+/// the last id in its subtree. Parent pointers and `dir_stats` entry ids are
+/// remapped to the new numbering. The input order already places every parent
+/// before its children, so the resulting tree is well-formed; any entry whose
+/// parent could not be resolved (sentinel `NONE`) is treated as a root and
+/// still visited, so no entry is ever dropped.
+fn reorder_dfs(
+    entries: Vec<PackedEntry>,
+    dir_stats: Vec<(u32, i64, u32)>,
+) -> (Vec<PackedEntry>, Vec<(u32, i64, u32)>, Vec<u32>) {
+    let n = entries.len();
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut tops: Vec<u32> = Vec::new();
+    for (id, e) in entries.iter().enumerate() {
+        if e.parent == NONE || (e.parent as usize) >= n {
+            tops.push(id as u32);
+        } else {
+            children[e.parent as usize].push(id as u32);
+        }
+    }
+
+    enum Task {
+        Enter(u32),
+        Close(u32),
+    }
+    let mut order: Vec<u32> = Vec::with_capacity(n); // new index -> old id
+    let mut new_of: Vec<u32> = vec![NONE; n];
+    let mut subtree_end: Vec<u32> = vec![0u32; n]; // indexed by NEW id
+    let mut stack: Vec<Task> = Vec::new();
+    for &top in tops.iter().rev() {
+        stack.push(Task::Enter(top));
+    }
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Enter(old) => {
+                let new = order.len() as u32;
+                new_of[old as usize] = new;
+                order.push(old);
+                stack.push(Task::Close(new));
+                for &child in children[old as usize].iter().rev() {
+                    stack.push(Task::Enter(child));
+                }
+            }
+            Task::Close(new) => {
+                subtree_end[new as usize] = order.len() as u32;
+            }
+        }
+    }
+
+    let mut new_entries: Vec<PackedEntry> = Vec::with_capacity(n);
+    for &old in &order {
+        let mut e = entries[old as usize];
+        if e.parent != NONE && (e.parent as usize) < n {
+            e.parent = new_of[e.parent as usize];
+        } else {
+            e.parent = NONE;
+        }
+        new_entries.push(e);
+    }
+
+    let new_dir_stats = dir_stats
+        .into_iter()
+        .map(|(rel_id, mtime, eid)| {
+            let mapped = new_of.get(eid as usize).copied().unwrap_or(NONE);
+            (rel_id, mtime, mapped)
+        })
+        .collect();
+
+    (new_entries, new_dir_stats, subtree_end)
 }
 
 fn push_rec(
@@ -213,6 +291,7 @@ fn write_catalog(
     mut intern: Intern,
     entries: Vec<PackedEntry>,
     dir_stats: Vec<(u32, i64, u32)>,
+    subtree_end: Vec<u32>,
 ) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -287,6 +366,11 @@ fn write_catalog(
         put_u32(&mut mtime_sec, id);
     }
 
+    let mut subtree_sec = Vec::with_capacity(subtree_end.len() * 4);
+    for end in &subtree_end {
+        put_u32(&mut subtree_sec, *end);
+    }
+
     let mut roots_sec = Vec::new();
     put_u32(&mut roots_sec, roots.roots.len() as u32);
     for r in &roots.roots {
@@ -338,6 +422,7 @@ fn write_catalog(
     (hdr.mtime_off, hdr.mtime_len) = place(&mut off, mtime_sec.len() as u64);
     (hdr.roots_off, hdr.roots_len) = place(&mut off, roots_sec.len() as u64);
     (hdr.path_tri_off, hdr.path_tri_len) = place(&mut off, path_tri_sec.len() as u64);
+    (hdr.subtree_off, hdr.subtree_len) = place(&mut off, subtree_sec.len() as u64);
 
     let mut opts = OpenOptions::new();
     opts.create(true).write(true).truncate(true);
@@ -357,6 +442,7 @@ fn write_catalog(
     f.write_all(&mtime_sec)?;
     f.write_all(&roots_sec)?;
     f.write_all(&path_tri_sec)?;
+    f.write_all(&subtree_sec)?;
     f.sync_all()?;
     drop(f);
     

@@ -1,7 +1,11 @@
 use crate::error::{Error, Result};
 
 pub const MAGIC: &[u8; 4] = b"UTFS";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+/// Oldest catalog version this build can still open (without the subtree
+/// fast-path). v2 catalogs load fine; they just fall back to substring path
+/// matching until re-indexed.
+pub const MIN_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 256;
 pub const ENTRY_LEN: usize = 32;
 pub const NONE: u32 = u32::MAX;
@@ -93,6 +97,10 @@ pub struct Header {
     pub roots_len: u64,
     pub path_tri_off: u64,
     pub path_tri_len: u64,
+    /// u32-per-entry array (in id order): one past the last id contained in
+    /// each entry's subtree. Requires DFS pre-order entry layout (v3+).
+    pub subtree_off: u64,
+    pub subtree_len: u64,
 }
 
 impl Header {
@@ -121,6 +129,8 @@ impl Header {
         put_u64(&mut b, 144, self.roots_len);
         put_u64(&mut b, 152, self.path_tri_off);
         put_u64(&mut b, 160, self.path_tri_len);
+        put_u64(&mut b, 168, self.subtree_off);
+        put_u64(&mut b, 176, self.subtree_len);
         b
     }
 
@@ -132,7 +142,7 @@ impl Header {
             return Err(Error::Corrupt("bad magic"));
         }
         let version = u16::from_le_bytes(b[4..6].try_into().unwrap());
-        if version != VERSION {
+        if version > VERSION || version < MIN_VERSION {
             return Err(Error::Version(version));
         }
         Ok(Self {
@@ -158,6 +168,8 @@ impl Header {
             roots_len: get_u64(b, 144),
             path_tri_off: get_u64(b, 152),
             path_tri_len: get_u64(b, 160),
+            subtree_off: get_u64(b, 168),
+            subtree_len: get_u64(b, 176),
         })
     }
 
