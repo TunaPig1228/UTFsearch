@@ -10,3 +10,17 @@ utfsearch.last
 Thumbs.db
 .env
 *.exe
+
+# Personal analysis and integration notes (not for public repo)
+IMPLEMENTATION_SUMMARY.md
+OPTIMIZATION_GUIDE.md
+PERFORMANCE_ANALYSIS.md
+QUICK_REFERENCE.md
+SEARCH_EFFICIENCY_ASSESSMENT.md
+TAURI_MCP_INTEGRATION.md
+
+# Personal configuration and test data
+*.ini
+test_wiztree_direct.csv
+問題集.txt
+WizTree*.ini
