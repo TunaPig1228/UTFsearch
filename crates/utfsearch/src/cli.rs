@@ -58,6 +58,9 @@ pub enum Cmd {
         exclude: Vec<String>,
         #[arg(long)]
         include_system: bool,
+        /// Force full rescan, ignoring mtime cache. Use to refresh specific folders without full rebuild.
+        #[arg(long)]
+        force: bool,
     },
     Search {
         fragment: Option<String>,
@@ -162,19 +165,21 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
             let catalog = resolve_catalog(&cli)?;
             let roots = resolve_roots(&catalog, &root, &exclude, !include_system, false)?;
             remember_catalog(&catalog);
-            let stats = build(&catalog, &roots, None)?;
+            let stats = build(&catalog, &roots, None, None)?;
             emit(&cli, &stats)
         }
         Cmd::Refresh {
             root,
             exclude,
             include_system,
+            force,
         } => {
             let catalog = resolve_catalog(&cli)?;
             let old = Catalog::open(&catalog).ok();
             let roots = resolve_roots(&catalog, &root, &exclude, !include_system, true)?;
             remember_catalog(&catalog);
-            let stats = build(&catalog, &roots, old.as_ref())?;
+            // If force is true, pass None for old to skip the mtime cache and rescan everything
+            let stats = build(&catalog, &roots, if force { None } else { old.as_ref() }, None)?;
             emit(&cli, &stats)
         }
         Cmd::Search {

@@ -26,7 +26,7 @@ pub struct BuildStats {
     pub catalog: String,
 }
 
-pub fn build(catalog_path: &Path, roots: &RootSet, old: Option<&Catalog>) -> Result<BuildStats> {
+pub fn build(catalog_path: &Path, roots: &RootSet, old: Option<&Catalog>, _refresh_path: Option<&str>) -> Result<BuildStats> {
     let casefold = cfg!(windows);
     let mut intern = Intern::new();
     let mut entries: Vec<PackedEntry> = Vec::new();
