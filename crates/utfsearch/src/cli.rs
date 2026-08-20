@@ -51,7 +51,7 @@ pub enum Cmd {
     },
     /// Incremental update. Reuses roots stored in the catalog.
     Refresh {
-        /// Optional override. Omit to keep the previous roots.
+        /// Folder(s) to refresh. If omitted, refreshes all existing roots. If specified, merges with existing roots.
         #[arg(long, short = 'r')]
         root: Vec<PathBuf>,
         #[arg(long)]
@@ -176,9 +176,13 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
         } => {
             let catalog = resolve_catalog(&cli)?;
             let old = Catalog::open(&catalog).ok();
-            let roots = resolve_roots(&catalog, &root, &exclude, !include_system, true)?;
+            // For refresh: if --root is specified, merge with existing roots; otherwise keep all existing
+            let roots = if !root.is_empty() {
+                resolve_roots_for_refresh(&catalog, &root, &exclude, !include_system)?
+            } else {
+                resolve_roots(&catalog, &root, &exclude, !include_system, true)?
+            };
             remember_catalog(&catalog);
-            // If force is true, pass None for old to skip the mtime cache and rescan everything
             let stats = build(&catalog, &roots, if force { None } else { old.as_ref() }, None)?;
             emit(&cli, &stats)
         }
@@ -282,6 +286,54 @@ fn resolve_roots(
     Err(utfsearch_core::Error::Msg(
         "first run needs --root <folder>".into(),
     ))
+}
+
+/// For refresh command: merge --root with existing roots (update or add)
+fn resolve_roots_for_refresh(
+    catalog: &Path,
+    new_roots: &[PathBuf],
+    exclude: &[String],
+    skip_system: bool,
+) -> Result<RootSet> {
+    // Load existing roots from catalog
+    let mut existing_roots = if catalog.exists() {
+        let cat = Catalog::open(catalog)?;
+        cat.root_set()?.roots
+    } else {
+        Vec::new()
+    };
+
+    // Create a set of new root paths for matching
+    let new_paths: std::collections::HashSet<_> = new_roots
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    // Update or add new roots
+    for new_root in new_roots {
+        let canonical_new = new_root.canonicalize().unwrap_or_else(|_| new_root.clone());
+        
+        // Check if this root already exists
+        if let Some(pos) = existing_roots.iter().position(|r| {
+            r.path.canonicalize().unwrap_or_else(|_| r.path.clone()) == canonical_new
+        }) {
+            // Update existing root with new exclude list
+            existing_roots[pos].excludes = exclude.to_vec();
+            existing_roots[pos].skip_system = skip_system;
+        } else {
+            // Add new root
+            existing_roots.push(Root {
+                id: 0,
+                name: String::new(),
+                path: new_root.clone(),
+                follow_links: false,
+                excludes: exclude.to_vec(),
+                skip_system,
+            });
+        }
+    }
+
+    RootSet::new(existing_roots)
 }
 
 /// `--catalog` > remembered path next to the exe > `catalog.uts` beside the exe.
