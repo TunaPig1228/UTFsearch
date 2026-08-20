@@ -523,13 +523,13 @@ fn parse_mtime(mtime_str: &str) -> i64 {
     let second = if time_parts.len() > 2 { time_parts[2].parse::<u32>().unwrap_or(0) } else { 0 };
     
     // Simple approximation (proper implementation would need chrono or time crate)
-    // This is a placeholder that calculates seconds since Unix epoch
-    // For now, just return seconds since year 2000 as a reasonable approximation
+    // This calculates seconds since Unix epoch (1970-01-01)
+    // days_since_epoch gives days since 2000-01-01, so we add the offset
     let days_since_2000 = days_since_epoch(year, month, day);
-    let seconds = (days_since_2000 as i64) * 86400 + (hour as i64 * 3600) + (minute as i64 * 60) + (second as i64);
+    let seconds_since_2000 = (days_since_2000 as i64) * 86400 + (hour as i64 * 3600) + (minute as i64 * 60) + (second as i64);
     
-    // Adjust to Unix epoch (1970)
-    seconds - 946684800 // Seconds between 1970 and 2000
+    // Adjust to Unix epoch (1970): add the seconds from 1970-01-01 to 2000-01-01
+    946684800 + seconds_since_2000 // Seconds between 1970 and 2000
 }
 
 fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
