@@ -22,6 +22,11 @@ pub struct Query {
     /// Multiple name filters - all must match (AND logic)
     pub names: Vec<String>,
     pub path: Option<String>,
+    /// Exact directory scope: a relative directory path **from a root** (e.g.
+    /// `finance/2024`). Resolves to that directory's contiguous subtree window
+    /// so the search only scans inside it. Distinct from `path`, which is a
+    /// substring match on the relative path.
+    pub dir: Option<String>,
     /// Convenience: matches filename **or** relative path.
     pub name_or_path: Option<String>,
     pub ext: Option<String>,
@@ -74,6 +79,7 @@ impl Query {
         for text in [
             self.name.as_deref(),
             self.path.as_deref(),
+            self.dir.as_deref(),
             self.name_or_path.as_deref(),
             self.owner.as_deref(),
         ]

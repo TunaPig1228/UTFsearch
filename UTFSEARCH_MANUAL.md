@@ -210,7 +210,8 @@ utfsearch search [文本] [選項]
 
 **過濾選項**:
 - `--name <文本>` - 文件名完全匹配或包含（可重複）
-- `--path <文本>` - 相對路徑包含
+- `--dir <相對目錄>` - **已知的相對目錄**（從根目錄起算，例: `finance/2024`）。把搜尋鎖定在該資料夾的子樹內，大幅加速。與 `--path` 不同：`--dir` 必須是真實存在的目錄路徑。
+- `--path <文本>` - 相對路徑的**片段子字串**比對（當你只記得路徑中的一小段名稱時使用）
 - `--ext <擴展名>` - 文件擴展名（無需 `.`）
 - `--owner <用戶>` - 文件所有者
 - `--root <名稱>` - 限制到特定根目錄
@@ -237,9 +238,12 @@ utfsearch search --name "invoice.xlsx"
 :: 多個名稱條件（OR）
 utfsearch search --name invoice --name report
 
-:: 按路徑搜索
-utfsearch search --path finance/2024
-utfsearch search --path "finance/2024" --ext xlsx
+:: 按已知目錄搜索（--dir，快）
+utfsearch search --dir finance/2024
+utfsearch search --dir "finance/2024" --ext xlsx
+
+:: 按路徑片段搜索（--path，子字串）
+utfsearch search --path invoices
 
 :: 按擴展名
 utfsearch search --ext pdf
@@ -507,32 +511,34 @@ utfsearch search --ext iso --min-size 1GB
 - **完全匹配**: `utfsearch search --name "invoice.xlsx"` 需要完全相同
 - **多條件 OR**: `utfsearch search --name invoice --name report` 匹配任一條件
 
-### 路徑匹配
+### 路徑匹配：`--dir`（已知目錄）與 `--path`（片段）
 
-`--path` 有兩種模式，程式會自動判斷：
+這是兩個**用途不同**的參數，請依情況選用：
 
-1. **目錄前綴（快速路徑，推薦）**：當 `--path` 的值正好是某個「從根目錄開始的相對目錄路徑」時，程式會直接鎖定該目錄的**子樹範圍**，只掃描該資料夾底下的項目。這是縮小範圍時效率大幅提升的關鍵。
-
-2. **片段回退（substring）**：當 `--path` 的值不是一個實際的目錄前綴（例如只給一個片段名稱）時，退回為對相對路徑做子字串比對。
+| 參數 | 用途 | 速度 |
+|------|------|------|
+| `--dir <相對目錄>` | 你**已經知道**檔案在哪個資料夾（從根目錄起算的完整相對目錄） | ⚡ 極快：只掃描該子樹 |
+| `--path <片段>` | 你只記得路徑中的**一小段名稱**，不確定完整目錄 | 一般：對相對路徑做子字串比對 |
 
 ```batch
-# ✅ 目錄前綴（快速）：finance/2024 是真實目錄，直接鎖定子樹
-utfsearch search invoice --path finance/2024
+# ⚡ --dir：finance/2024 是真實目錄 → 直接鎖定子樹，只掃描該資料夾
+utfsearch search invoice --dir finance/2024
 
-# ✅ 更深的前綴，範圍更小、更快
-utfsearch search invoice --path finance/2024/invoices
+# ⚡ 目錄越深、範圍越小、越快（在數百萬筆的 catalog 上可達數萬倍加速）
+utfsearch search invoice --dir "finance/2024/客戶A/發票"
 
-# 片段回退：invoices 不是從根開始的完整路徑 → 子字串比對
+# --path：只記得路徑裡有 "invoices" 這個片段 → 子字串比對
 utfsearch search invoice --path invoices
 ```
 
-**重點**：
+**`--dir` 的重點**：
 - 路徑一律**相對於索引的根目錄**（不要包含根目錄名稱本身）。
 - 支援 `/` 或 `\`，前後多餘的斜線會自動忽略（`finance\2024\` = `finance/2024`）。
-- 目錄前綴用 DFS 區間標記（nested-set）在**微秒級**解析成一段連續 id 區間，成本只跟「路徑深度」有關，與 catalog 大小無關——不會建立任何整庫索引。
-- 在**大型 catalog** 上搜尋冷門／舊檔時，縮小 `--path` 可省去往 mtime 索引深處掃描與整庫排序的成本；在小型 catalog 上，搜尋本就是亞毫秒級，總時間主要花在行程啟動與開啟 catalog（見「搜索優化」一節）。
+- 用 DFS 區間標記（nested-set）在**微秒級**把目錄解析成一段連續 id 區間，接著**只掃描這個範圍**、完全跳過整庫的三連字母索引與整庫掃描。這就是「已經把範圍縮小，就應該顯著加速」的實作。
+- 若 `--dir` 指定的目錄在 catalog 中**不存在**，會直接回傳 0 筆（不會退回整庫掃描），方便你及早發現路徑打錯。
+- **加速幅度與縮小幅度成正比**：縮到一個很深的小資料夾 → 微秒級；縮到一個仍有上百萬檔案的頂層資料夾 → 只會少掃一部分。
 
-> ℹ️ 此快速路徑需要 catalog 為 v3 格式。舊的 v2 catalog 仍可讀取，但會退回子字串比對；重新執行一次 `utfsearch index`（或 `refresh`）即可升級並啟用。
+> ℹ️ `--dir` 需要 catalog 為 v3 格式。舊的 v2 catalog 請重新執行一次 `utfsearch index`（或 `refresh`）升級。
 
 ---
 
@@ -914,34 +920,32 @@ utfsearch index --root "D:\Share\Projects" --root "D:\Share\Data"
 #### 利用過濾器減少結果集
 
 ```batch
-:: ❌ 慢：掃描所有 100M 文件
-utfsearch search "2024" --limit 1000
+:: ❌ 慢：在整個 catalog（數百萬筆）中掃描
+utfsearch search invoice --limit 1000
 
-:: ✅ 快：用「目錄前綴」把範圍鎖到子樹，再搜索
-utfsearch search "2024" --path "finance/2024" --ext xlsx --limit 1000
+:: ✅ 快：用 --dir 把範圍鎖到已知資料夾的子樹，再搜索
+utfsearch search invoice --dir "finance/2024" --ext xlsx --limit 1000
 ```
 
 #### 使用選擇性過濾
 
-- **`--path` 目錄前綴會把搜尋鎖定到該資料夾的連續子樹範圍**：給出從根目錄開始的相對目錄路徑（如 `finance/2024`），程式用 DFS 區間標記（nested-set）在**微秒級**把 `--path` 解析成一段連續 id 區間，只掃描該資料夾，不做整庫掃描、也不建立整庫的排序索引。
+- **最有效的優化是 `--dir <已知相對目錄>`**：給出從根目錄開始的完整相對目錄，程式用 DFS 區間標記（nested-set）在**微秒級**把它解析成一段連續 id 區間，**只掃描該資料夾的子樹**，完全跳過整庫的三連字母索引與整庫掃描。縮得越深、越小，加速越明顯。
 
-> ⚠️ **重要的效能觀念**：在**單次 CLI 呼叫**中，搜尋本身通常只需 0.1–0.5 毫秒，真正的耗時是「行程啟動 + 開啟 catalog（記憶體映射與索引載入）」，約數十毫秒且與是否縮小範圍**無關**。因此在小型或中型 catalog 上，縮小 `--path` 不會讓「總時間」明顯變短——因為搜尋本來就不是瓶頸。
->
-> `--path` 目錄前綴真正發揮價值的時機：
-> 1. **正確鎖定範圍**：只回傳該資料夾底下的結果。
-> 2. **大型 catalog（數百萬筆）上的冷門／舊檔查詢**：不縮範圍時可能要往 mtime 索引深處掃描並建立整庫排序表（數毫秒～數十毫秒）；縮小到子樹後直接讀取該資料夾項目，省去這些成本。
-> 3. **比路徑「片段子字串」比對快數倍**：完整目錄前綴走 DFS 區間，片段比對則需逐一還原每筆的相對路徑。
->
-> 💡 **要讓互動／重複查詢真正「秒回」**：改用常駐伺服器模式 `utfsearch mcp`，catalog 只開啟一次、之後每次查詢都是亞毫秒級——此時 `--path` 的微秒級搜尋才會被你實際感受到。
+> 📊 **實測（5,533,917 筆 / 1.17 GB catalog）**：
+> - `search --name invoice`（不縮範圍）→ 搜尋 **5.68 秒**（掃描整庫）
+> - `search --name invoice --dir "<深層資料夾>"` → 搜尋 **0.17 毫秒**（約 3.4 萬倍）
+> - 開啟 catalog：**約 0.25 秒**（延遲載入索引後，與 catalog 大小幾乎無關）
+
+> ⚠️ **效能觀念**：`--dir` 加速的是「搜尋」本身。單次 CLI 呼叫的其餘時間花在「行程啟動 + 開啟 catalog」。若你要**重複查詢**，改用常駐伺服器模式 `utfsearch mcp`：catalog 只開一次，之後每次查詢都是微秒～毫秒級。
 
 其餘過濾器建議依選擇性由高到低組合：
 
-1. `--path <目錄前綴>` (鎖定子樹範圍，大型 catalog 上避免深掃描)
+1. `--dir <已知相對目錄>` (最有效：只掃描該子樹)
 2. `--ext` (副檔名索引，通常很選擇性)
 3. `--owner` (所有者過濾)
 4. `--after/--before` (時間過濾)
 5. `--min-size/--max-size` (大小過濾)
-6. `--name` (名稱片段)
+6. `--name` / `--path` (名稱／路徑片段：需逐筆比對)
 
 ### 3. Catalog 檔案
 
@@ -1185,9 +1189,9 @@ utfsearch search invoice
 :: 搜索（複雜）
 utfsearch --format json search --name invoice --ext xlsx --after 2024-01-01 --limit 100
 
-:: ⚡ 搜索（路徑前綴加速 — 推薦！）
-utfsearch search invoice --path finance/2024
-utfsearch search --name invoice --path finance/2024/invoices --ext xlsx
+:: ⚡ 搜索（已知目錄加速 — 推薦！）
+utfsearch search invoice --dir finance/2024
+utfsearch search --name invoice --dir finance/2024/invoices --ext xlsx
 
 :: 查看狀態
 utfsearch status
@@ -1200,10 +1204,11 @@ utfsearch tree finance/2024
 
 ```batch
 :: ⚡ 加速查詢：用 --path 縮小相對路徑範圍（最有效的優化）
-utfsearch --format json --quiet search --name %NAME% --path %DIR% --ext %EXT% --limit %LIMIT%
+:: ⚡ 加速查詢：用 --dir 鎖定已知的相對目錄（最有效的優化）
+utfsearch --format json --quiet search --name %NAME% --dir %DIR% --ext %EXT% --limit %LIMIT%
 
 :: 範例
-utfsearch --format json --quiet search --name invoice --path finance/2024 --ext xlsx --limit 100
+utfsearch --format json --quiet search --name invoice --dir finance/2024 --ext xlsx --limit 100
 
 :: AI 查詢
 utfsearch --format json --quiet search --path %PATH% --ext %EXT% --min-size %SIZE% --limit %LIMIT%
@@ -1215,7 +1220,7 @@ utfsearch --format json --quiet search --limit 100 --cursor %CURSOR%
 utfsearch search --after %DATE1% --before %DATE2% --limit 500
 
 :: 複合過濾（依選擇性排序）
-utfsearch search --path %DIR% --name %NAME% --ext %EXT% --owner %USER% --after %DATE%
+utfsearch search --dir %DIR% --name %NAME% --ext %EXT% --owner %USER% --after %DATE%
 ```
 
 ### 環境變數

@@ -18,7 +18,7 @@ use crate::catalog::format::{
     read_u16, read_u32, Header, PackedEntry, ENTRY_LEN, HEADER_LEN, NONE,
 };
 use crate::catalog::intern::Intern;
-use crate::catalog::trigram::{intersect_postings, trigrams};
+use crate::catalog::trigram::trigrams;
 use crate::error::{Error, Result};
 use crate::jail::jail_join;
 use crate::normalize::{ext_key, search_key};
@@ -35,10 +35,14 @@ pub struct Catalog {
     map: Mmap,
     hdr: Header,
     intern: Intern,
-    name_trigrams: Vec<(u32, RoaringBitmap)>,
-    path_trigrams: Vec<(u32, RoaringBitmap)>,
-    ext_idx: Vec<(u16, RoaringBitmap)>,
-    owner_idx: Vec<(u16, RoaringBitmap)>,
+    /// Trigram/attribute postings are NOT deserialized at open. Each index is a
+    /// directory `key -> (mmap offset, len)`; the RoaringBitmap for a key is
+    /// decoded on demand, so `open()` cost is independent of catalog size and a
+    /// query only pays for the handful of postings it actually touches.
+    name_trigrams: LazyIndex,
+    path_trigrams: LazyIndex,
+    ext_idx: LazyIndex,
+    owner_idx: LazyIndex,
     mtime_ids: Vec<u32>,
     /// One past the last id in each entry's subtree (DFS pre-order layout,
     /// v3+). Empty for legacy v2 catalogs, which disables the prefix fast
@@ -85,7 +89,7 @@ pub struct Hit {
     pub owner: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Page {
     pub hits: Vec<Hit>,
     pub more: bool,
@@ -117,14 +121,30 @@ impl Catalog {
         }
         let hdr = Header::decode(&map)?;
         let intern = load_intern(slice(&map, hdr.intern_off, hdr.intern_len)?)?;
-        let name_trigrams = load_u32_bitmaps(slice(&map, hdr.tri_off, hdr.tri_len)?)?;
+        let name_trigrams = LazyIndex::build(
+            slice(&map, hdr.tri_off, hdr.tri_len)?,
+            hdr.tri_off,
+            KeyWidth::U32,
+        )?;
         let path_trigrams = if hdr.path_tri_len > 0 {
-            load_u32_bitmaps(slice(&map, hdr.path_tri_off, hdr.path_tri_len)?)?
+            LazyIndex::build(
+                slice(&map, hdr.path_tri_off, hdr.path_tri_len)?,
+                hdr.path_tri_off,
+                KeyWidth::U32,
+            )?
         } else {
-            Vec::new()
+            LazyIndex::default()
         };
-        let ext_idx = load_u16_bitmaps(slice(&map, hdr.ext_off, hdr.ext_len)?)?;
-        let owner_idx = load_u16_bitmaps(slice(&map, hdr.owner_off, hdr.owner_len)?)?;
+        let ext_idx = LazyIndex::build(
+            slice(&map, hdr.ext_off, hdr.ext_len)?,
+            hdr.ext_off,
+            KeyWidth::U16,
+        )?;
+        let owner_idx = LazyIndex::build(
+            slice(&map, hdr.owner_off, hdr.owner_len)?,
+            hdr.owner_off,
+            KeyWidth::U16,
+        )?;
         let mtime_ids = load_u32_list(slice(&map, hdr.mtime_off, hdr.mtime_len)?)?;
         let subtree_end = if hdr.subtree_len > 0 {
             load_u32_list(slice(&map, hdr.subtree_off, hdr.subtree_len)?)?
@@ -408,34 +428,38 @@ impl Catalog {
     fn search_uncached(&self, q: &Query) -> Result<Page> {
         let casefold = self.hdr.casefold();
 
-        // Directory-prefix fast path: when `--path` names an actual directory
-        // (a relative path from a root), collapse it to that directory's
-        // contiguous subtree id window instead of a substring scan. This is the
-        // single biggest win for "I know roughly which folder" queries.
-        let prefix_range = q
-            .path
-            .as_deref()
-            .and_then(|p| self.resolve_prefix_dir(p, q.root.as_deref(), casefold));
-
-        // When the prefix resolved exactly, drop the substring path filter so
-        // `passes()` never pays for the parent-chain `rel_path` walk; the id
-        // window already encodes the constraint precisely.
-        let effective;
-        let q: &Query = if prefix_range.is_some() {
-            let mut e = q.clone();
-            e.path = None;
-            effective = e;
-            &effective
-        } else {
-            q
+        // Exact directory scope (`--dir`): resolve the relative directory to its
+        // contiguous subtree id window. This is the "I know which folder" fast
+        // path — the search only ever touches entries inside that window.
+        let prefix_range = match q.dir.as_deref() {
+            Some(d) => match self.resolve_prefix_dir(d, q.root.as_deref(), casefold) {
+                Some(r) => Some(r),
+                // A `--dir` that names no real directory in the catalog cannot
+                // match anything; return an empty page rather than silently
+                // scanning the whole catalog.
+                None => return Ok(Page::default()),
+            },
+            None => None,
         };
 
-        let mut cand = self.seed_candidates(q, casefold)?;
+        // Skip trigram seeding entirely when scoped to a small directory: the
+        // window is small enough to scan directly, and `passes()` verifies the
+        // name/path/ext/owner predicates. This avoids both the trigram posting
+        // work and any catalog-wide fallback scan — the core reason a narrowed
+        // directory search is fast.
+        let scoped_scan = matches!(prefix_range, Some((d, e))
+            if (e.saturating_sub(d) as usize) <= SUBTREE_MATERIALIZE_MAX);
+
+        let mut cand = if scoped_scan {
+            None
+        } else {
+            self.seed_candidates(q, casefold)?
+        };
 
         if let Some(ext) = q.ext.as_deref() {
             if let Some(id) = self.intern.lookup(&ext_key(ext)) {
-                if let Some(bm) = lookup_u16(&self.ext_idx, id as u16) {
-                    cand = intersect_opt(cand, bm);
+                if let Some(bm) = self.ext_idx.get(&self.map, id as u32) {
+                    cand = intersect_opt(cand, &bm);
                 } else {
                     cand = Some(RoaringBitmap::new());
                 }
@@ -446,8 +470,8 @@ impl Catalog {
         if let Some(owner) = q.owner.as_deref() {
             let key = search_key(owner, true);
             if let Some(id) = self.intern.lookup(&key) {
-                if let Some(bm) = lookup_u16(&self.owner_idx, id as u16) {
-                    cand = intersect_opt(cand, bm);
+                if let Some(bm) = self.owner_idx.get(&self.map, id as u32) {
+                    cand = intersect_opt(cand, &bm);
                 } else {
                     // contains fallback: no index hit — scan
                     cand = cand.or(None);
@@ -469,10 +493,13 @@ impl Catalog {
         // away early termination for a broad query.
         const CANDIDATE_SCAN_MAX: usize = 8192;
         // A resolved directory prefix yields a contiguous id window. Iterating
-        // that window and sorting by entry mtime is cheap for anything up to a
-        // large folder, and — crucially — it is what makes "I narrowed the
-        // relative path" queries fast even without a selective name filter.
-        const SUBTREE_MATERIALIZE_MAX: usize = 1 << 18; // 262_144
+        // that window and sorting by entry mtime is cheap relative to streaming
+        // the whole catalog, and — crucially — it is what makes "I narrowed the
+        // relative path" queries fast even without a selective name filter. The
+        // cap is generous (a few million) because a narrowed window is almost
+        // always far smaller than the catalog; above it, streaming the global
+        // mtime index with an `in_range` test is comparable anyway.
+        const SUBTREE_MATERIALIZE_MAX: usize = 1 << 21; // 2_097_152
 
         // Choose an id source for the small-candidate fast path.
         let small_ids: Option<Vec<u32>> = if let Some((d, e)) = prefix_range {
@@ -703,15 +730,15 @@ impl Catalog {
     fn seed_candidates(&self, q: &Query, casefold: bool) -> Result<Option<RoaringBitmap>> {
         let mut acc: Option<RoaringBitmap> = None;
         if let Some(name) = q.name.as_deref() {
-            acc = and_trigrams(acc, &self.name_trigrams, &search_key(name, casefold));
+            acc = self.and_trigrams(acc, &self.name_trigrams, &search_key(name, casefold));
         }
         if let Some(path) = q.path.as_deref() {
-            acc = and_trigrams(acc, &self.path_trigrams, &search_key(path, casefold));
+            acc = self.and_trigrams(acc, &self.path_trigrams, &search_key(path, casefold));
         }
         if let Some(nop) = q.name_or_path.as_deref() {
             let key = search_key(nop, casefold);
-            let names = and_trigrams(None, &self.name_trigrams, &key);
-            let paths = and_trigrams(None, &self.path_trigrams, &key);
+            let names = self.and_trigrams(None, &self.name_trigrams, &key);
+            let paths = self.and_trigrams(None, &self.path_trigrams, &key);
             let uni = match (names, paths) {
                 (Some(a), Some(b)) => Some(a | b),
                 (Some(a), None) => Some(a),
@@ -725,6 +752,47 @@ impl Catalog {
             };
         }
         Ok(acc)
+    }
+
+    /// Intersect `acc` with the posting lists for every trigram of `key`,
+    /// resolving each posting from the mmap on demand (lazy). A key shorter than
+    /// 3 chars has no trigrams, so `acc` is returned unchanged (the caller's
+    /// `passes()` verifies such short fragments by scanning).
+    fn and_trigrams(
+        &self,
+        acc: Option<RoaringBitmap>,
+        index: &LazyIndex,
+        key: &str,
+    ) -> Option<RoaringBitmap> {
+        if key.chars().count() < 3 {
+            return acc;
+        }
+        let grams = trigrams(key);
+        if grams.is_empty() {
+            return acc;
+        }
+        // Resolve every gram to its posting list. A missing gram means no entry
+        // can contain the substring, so the intersection is empty.
+        let mut posts: Vec<RoaringBitmap> = Vec::with_capacity(grams.len());
+        for g in &grams {
+            match index.get(&self.map, *g) {
+                Some(bm) => posts.push(bm),
+                None => return Some(RoaringBitmap::new()),
+            }
+        }
+        // Smallest posting lists first, keeping the accumulator minimal.
+        posts.sort_unstable_by_key(|bm| bm.len());
+        let mut bm = posts.swap_remove(0);
+        for other in &posts {
+            if bm.is_empty() {
+                break;
+            }
+            bm &= other;
+        }
+        Some(match acc {
+            None => bm,
+            Some(a) => a & bm,
+        })
     }
 
     fn passes(&self, q: &Query, id: u32, e: &PackedEntry, casefold: bool) -> bool {
@@ -861,31 +929,11 @@ fn budget_full(hits: &[Hit]) -> bool {
     n >= PAGE_BUDGET
 }
 
-fn and_trigrams(
-    acc: Option<RoaringBitmap>,
-    index: &[(u32, RoaringBitmap)],
-    key: &str,
-) -> Option<RoaringBitmap> {
-    if key.chars().count() < 3 {
-        return acc;
-    }
-    match intersect_postings(index, &trigrams(key)) {
-        Some(bm) => intersect_opt(acc, &bm),
-        None => acc,
-    }
-}
-
 fn intersect_opt(acc: Option<RoaringBitmap>, bm: &RoaringBitmap) -> Option<RoaringBitmap> {
     Some(match acc {
         None => bm.clone(),
         Some(a) => a & bm,
     })
-}
-
-fn lookup_u16<'a>(idx: &'a [(u16, RoaringBitmap)], k: u16) -> Option<&'a RoaringBitmap> {
-    idx.binary_search_by_key(&k, |(a, _)| *a)
-        .ok()
-        .map(|i| &idx[i].1)
 }
 
 fn slice(map: &Mmap, off: u64, len: u64) -> Result<&[u8]> {
@@ -905,40 +953,54 @@ fn load_intern(sec: &[u8]) -> Result<Intern> {
     Ok(Intern::from_serialized(&offsets, blob))
 }
 
-fn load_u32_bitmaps(sec: &[u8]) -> Result<Vec<(u32, RoaringBitmap)>> {
-    if sec.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut off = 0;
-    let n = read_u32(sec, &mut off)?;
-    let mut out = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        let k = read_u32(sec, &mut off)?;
-        let ln = read_u32(sec, &mut off)? as usize;
-        let bytes = sec.get(off..off + ln).ok_or(Error::Corrupt("trigram"))?;
-        off += ln;
-        let bm = RoaringBitmap::deserialize_from(bytes).map_err(|_| Error::Corrupt("roaring"))?;
-        out.push((k, bm));
-    }
-    Ok(out)
+/// Lazy, memory-mapped posting index. `open()` only scans section headers to
+/// record each key's byte range; the RoaringBitmap is deserialized on demand.
+/// This is what keeps `open()` cost independent of catalog size — a query pays
+/// only for the handful of postings it actually touches.
+#[derive(Default)]
+struct LazyIndex {
+    /// `(key, absolute mmap offset, byte length)`, ascending by key.
+    dir: Vec<(u32, u64, u32)>,
 }
 
-fn load_u16_bitmaps(sec: &[u8]) -> Result<Vec<(u16, RoaringBitmap)>> {
-    if sec.is_empty() {
-        return Ok(Vec::new());
+#[derive(Clone, Copy)]
+enum KeyWidth {
+    U16,
+    U32,
+}
+
+impl LazyIndex {
+    /// Walk the section headers only — skipping over each bitmap's bytes without
+    /// deserializing — to build the key -> byte-range directory.
+    fn build(sec: &[u8], sec_abs_off: u64, key_width: KeyWidth) -> Result<Self> {
+        if sec.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut off = 0usize;
+        let n = read_u32(sec, &mut off)?;
+        let mut dir = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let k = match key_width {
+                KeyWidth::U16 => read_u16(sec, &mut off)? as u32,
+                KeyWidth::U32 => read_u32(sec, &mut off)?,
+            };
+            let ln = read_u32(sec, &mut off)? as usize;
+            if off + ln > sec.len() {
+                return Err(Error::Corrupt("posting oob"));
+            }
+            dir.push((k, sec_abs_off + off as u64, ln as u32));
+            off += ln;
+        }
+        Ok(Self { dir })
     }
-    let mut off = 0;
-    let n = read_u32(sec, &mut off)?;
-    let mut out = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        let k = read_u16(sec, &mut off)?;
-        let ln = read_u32(sec, &mut off)? as usize;
-        let bytes = sec.get(off..off + ln).ok_or(Error::Corrupt("idx"))?;
-        off += ln;
-        let bm = RoaringBitmap::deserialize_from(bytes).map_err(|_| Error::Corrupt("roaring"))?;
-        out.push((k, bm));
+
+    /// Deserialize the posting list for `key` from the mmap on demand.
+    fn get(&self, map: &Mmap, key: u32) -> Option<RoaringBitmap> {
+        let i = self.dir.binary_search_by_key(&key, |&(k, _, _)| k).ok()?;
+        let (_, off, len) = self.dir[i];
+        let bytes = map.get(off as usize..off as usize + len as usize)?;
+        RoaringBitmap::deserialize_from(bytes).ok()
     }
-    Ok(out)
 }
 
 fn load_u32_list(sec: &[u8]) -> Result<Vec<u32>> {

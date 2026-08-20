@@ -63,8 +63,14 @@ pub enum Cmd {
         fragment: Option<String>,
         #[arg(long)]
         name: Vec<String>,
+        /// Substring match on the relative path.
         #[arg(long)]
         path: Option<String>,
+        /// Exact directory scope: a known relative directory from the root
+        /// (e.g. finance/2024). Restricts the search to that folder's subtree
+        /// for a large speed-up. Use --path instead for a path fragment.
+        #[arg(long)]
+        dir: Option<String>,
         #[arg(long)]
         ext: Option<String>,
         #[arg(long)]
@@ -175,6 +181,7 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
             fragment,
             name,
             path,
+            dir,
             ext,
             owner,
             after,
@@ -203,6 +210,7 @@ fn dispatch(cli: Cli, cmd: Cmd) -> Result<()> {
             }
             q.name_or_path = None;
             q.path = path;
+            q.dir = dir;
             q.ext = ext;
             q.owner = owner;
             q.mtime_min = after.as_deref().map(parse_time).transpose()?;

@@ -146,7 +146,7 @@ fn skips_node_modules_and_venv() {
 }
 
 #[test]
-fn path_prefix_restricts_to_subtree() {
+fn dir_scope_restricts_to_subtree() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("root");
     // Same filename in two different subtrees.
@@ -161,23 +161,23 @@ fn path_prefix_restricts_to_subtree() {
     build(&cat_path, &roots(&root, &[]), None).unwrap();
     let cat = Catalog::open(&cat_path).unwrap();
 
-    // Prefix limits results to the 2024 subtree only.
+    // --dir limits results to the 2024 subtree only.
     let mut q = Query::new();
     q.name = Some("report".into());
-    q.path = Some("finance/2024".into());
+    q.dir = Some("finance/2024".into());
     let page = cat.search(q).unwrap();
     assert_eq!(page.hits.len(), 1, "hits={:?}", page.hits);
     assert!(page.hits[0].rel.contains("finance/2024/invoices/report.xlsx"));
 
-    // Deeper prefix still works.
+    // Deeper --dir still works.
     let mut q = Query::new();
     q.name = Some("report".into());
-    q.path = Some("finance/2024/invoices".into());
+    q.dir = Some("finance/2024/invoices".into());
     assert_eq!(cat.search(q).unwrap().hits.len(), 1);
 
-    // A path prefix with no name returns every file under the subtree.
+    // A --dir with no name returns every file under the subtree.
     let mut q = Query::new();
-    q.path = Some("finance/2023".into());
+    q.dir = Some("finance/2023".into());
     let page = cat.search(q).unwrap();
     assert!(page.hits.iter().all(|h| h.rel.contains("finance/2023")));
     assert!(page.hits.iter().any(|h| h.rel.ends_with("report.xlsx")));
@@ -185,12 +185,18 @@ fn path_prefix_restricts_to_subtree() {
     // Backslash separators and trailing slash normalize the same way.
     let mut q = Query::new();
     q.name = Some("report".into());
-    q.path = Some("finance\\2024\\".into());
+    q.dir = Some("finance\\2024\\".into());
     assert_eq!(cat.search(q).unwrap().hits.len(), 1);
 
-    // A bare fragment that is not a real directory prefix still matches via
-    // the substring fallback (all three files live under an "invoices" dir or
-    // "old").
+    // A --dir that names no real directory yields no hits (explicit, not a
+    // silent whole-catalog scan).
+    let mut q = Query::new();
+    q.name = Some("report".into());
+    q.dir = Some("finance/2099".into());
+    assert_eq!(cat.search(q).unwrap().hits.len(), 0);
+
+    // --path stays a substring match on the relative path: "invoices" matches
+    // both files that live under an "invoices" directory.
     let mut q = Query::new();
     q.name = Some("report".into());
     q.path = Some("invoices".into());

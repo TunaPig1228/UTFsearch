@@ -73,13 +73,14 @@ fn tools() -> Value {
     json!([
         {
             "name": "search_files",
-            "description": "Search the catalog by name, path, extension, owner, mtime, or size. Newest first. Default 200 hits, max 5000. Does not read file contents.",
+            "description": "Search the catalog by name, path, extension, owner, mtime, or size. Newest first. Default 200 hits, max 5000. Does not read file contents. Use 'dir' for a known relative directory (fast subtree scope); use 'path' for a path fragment substring.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "fragment": { "type": "string" },
                     "name": { "type": "string" },
                     "path": { "type": "string" },
+                    "dir": { "type": "string" },
                     "ext": { "type": "string" },
                     "owner": { "type": "string" },
                     "after": { "type": "string" },
@@ -156,6 +157,7 @@ fn query_from(args: &Value) -> Result<Query> {
                 .map(str::to_string)
         });
     q.path = args.get("path").and_then(|v| v.as_str()).map(str::to_string);
+    q.dir = args.get("dir").and_then(|v| v.as_str()).map(str::to_string);
     q.ext = args.get("ext").and_then(|v| v.as_str()).map(str::to_string);
     q.owner = args
         .get("owner")
